@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: dailystock-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: dailystock
+      POSTGRES_PASSWORD: dailystock
+      POSTGRES_DB: dailystock
+    ports:
+      - "55432:5432"
+    volumes:
+      - dailystock_pgdata:/var/lib/postgresql/data
+
+volumes:
+  dailystock_pgdata:
