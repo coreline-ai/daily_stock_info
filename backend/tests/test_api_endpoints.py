@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 
@@ -25,7 +27,7 @@ def _allow_strategy_guard(
             "requestedDate": session_date,
             "availableStrategies": [strategy],
             "defaultStrategy": strategy,
-            "messages": {"premarket": "ok", "close": "ok"},
+            "messages": {"premarket": "ok", "intraday": "ok", "close": "ok"},
             "errorCode": None,
             "detail": None,
             "strategy": (requested_strategy or strategy),
@@ -357,7 +359,7 @@ def test_strategy_status_endpoint(monkeypatch) -> None:
             "requestedDate": "2026-02-20",
             "availableStrategies": ["premarket"],
             "defaultStrategy": "premarket",
-            "messages": {"premarket": "active", "close": "locked"},
+            "messages": {"premarket": "active", "intraday": "locked", "close": "locked"},
             "errorCode": None,
             "detail": None,
             "nonTradingDay": None,
@@ -379,7 +381,7 @@ def test_strategy_status_non_trading_day_details(monkeypatch) -> None:
             "requestedDate": "2026-02-17",
             "availableStrategies": [],
             "defaultStrategy": None,
-            "messages": {"premarket": "closed", "close": "closed"},
+            "messages": {"premarket": "closed", "intraday": "closed", "close": "closed"},
             "errorCode": "NON_TRADING_DAY",
             "detail": "Requested date 2026-02-17 is not a KRX trading day. (공휴일(설날))",
             "nonTradingDay": {
@@ -410,3 +412,9 @@ def test_strategy_guard_error_shape(monkeypatch) -> None:
     assert res.status_code == 400
     payload = res.json()
     assert payload["detail"]["code"] == "STRATEGY_NOT_AVAILABLE"
+
+
+def test_intraday_cache_bucket_rounds_5_minutes(monkeypatch) -> None:
+    monkeypatch.setattr(api_main, "now_in_kst", lambda: datetime(2026, 2, 20, 10, 7, 31, tzinfo=ZoneInfo("Asia/Seoul")))
+    bucket = api_main._intraday_cache_bucket("intraday", "2026-02-20")
+    assert bucket == "202602201005"

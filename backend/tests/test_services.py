@@ -9,6 +9,7 @@ import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
+import services.backtest_service as backtest_service
 import services.llm_service as llm_service
 import services.scoring_service as scoring_service
 from services.backtest_service import compute_forward_returns
@@ -20,6 +21,7 @@ from services.scoring_service import (
     apply_diversified_sampling,
     detect_market_regime,
     fetch_and_score_stocks,
+    get_latest_trading_date,
     get_non_trading_day_info,
     get_strategy_status,
     normalize_weights,
@@ -125,6 +127,40 @@ def test_backtest_returns_t1_t3_t5() -> None:
     assert rets["ret_t5"] == 6.0
 
 
+def test_backfill_daterange_skips_non_trading_day(monkeypatch) -> None:
+    monkeypatch.setattr(backtest_service, "is_krx_trading_day", lambda day: day != "2026-02-17")
+    dates = backtest_service._daterange("2026-02-16", "2026-02-18")
+    assert dates == ["2026-02-16", "2026-02-18"]
+
+
+def test_backfill_inserted_counts_only_new_candidates(monkeypatch) -> None:
+    monkeypatch.setattr(backtest_service, "_daterange", lambda start_date, end_date: ["2026-02-20", "2026-02-21"])
+    monkeypatch.setattr(
+        backtest_service,
+        "fetch_and_score_stocks",
+        lambda date_str, weights, include_sparkline: {
+            "date": date_str,
+            "candidates": [{"code": "005930", "rank": 1}],
+        },
+    )
+    monkeypatch.setattr(backtest_service, "_upsert_snapshot", lambda session, trade_date, candidate: False)
+    monkeypatch.setattr(backtest_service, "_upsert_backtest", lambda session, trade_date, candidate: False)
+
+    class DummySession:
+        pass
+
+    class DummySessionScope:
+        def __enter__(self):
+            return DummySession()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(backtest_service, "session_scope", lambda: DummySessionScope())
+    inserted = backtest_service.backfill_snapshots("2026-02-20", "2026-02-21")
+    assert inserted == 0
+
+
 def test_market_regime_recommendation() -> None:
     candidates = [
         {"changeRate": 1.2},
@@ -172,6 +208,11 @@ def test_validate_recommendation_request_date_blocks_before_close(monkeypatch) -
     assert "사용할 수 없습니다" in error
 
 
+def test_get_latest_trading_date_skips_non_trading_day(monkeypatch) -> None:
+    monkeypatch.setattr(scoring_service, "is_krx_trading_day", lambda day: day == "2026-02-16")
+    assert get_latest_trading_date("2026-02-17") == "2026-02-16"
+
+
 def test_strategy_status_today_premarket_window(monkeypatch) -> None:
     monkeypatch.setattr(
         scoring_service,
@@ -196,6 +237,19 @@ def test_strategy_status_today_close_window(monkeypatch) -> None:
     assert status["defaultStrategy"] == "close"
 
 
+def test_strategy_status_today_intraday_window(monkeypatch) -> None:
+    monkeypatch.setattr(
+        scoring_service,
+        "now_in_kst",
+        lambda: datetime(2026, 2, 20, 10, 0, tzinfo=scoring_service.KST),
+    )
+    monkeypatch.setattr(scoring_service, "is_krx_trading_day", lambda _: True)
+    status = get_strategy_status("2026-02-20")
+    assert status["availableStrategies"] == ["premarket", "intraday"]
+    assert status["defaultStrategy"] == "intraday"
+    assert "장중 단타" in status["messages"]["intraday"]
+
+
 def test_strategy_auto_fails_before_0800(monkeypatch) -> None:
     monkeypatch.setattr(
         scoring_service,
@@ -206,6 +260,18 @@ def test_strategy_auto_fails_before_0800(monkeypatch) -> None:
     resolved = validate_strategy_request(None, "2026-02-20")
     assert resolved["errorCode"] == "STRATEGY_NOT_AVAILABLE"
     assert resolved.get("strategy") is None
+
+
+def test_strategy_intraday_is_blocked_after_intraday_close(monkeypatch) -> None:
+    monkeypatch.setattr(
+        scoring_service,
+        "now_in_kst",
+        lambda: datetime(2026, 2, 20, 15, 25, tzinfo=scoring_service.KST),
+    )
+    monkeypatch.setattr(scoring_service, "is_krx_trading_day", lambda _: True)
+    resolved = validate_strategy_request("intraday", "2026-02-20")
+    assert resolved["errorCode"] == "STRATEGY_NOT_AVAILABLE"
+    assert "intraday" in str(resolved.get("detail", "")).lower()
 
 
 def test_premarket_scoring_contains_signal_block(monkeypatch) -> None:
@@ -241,6 +307,77 @@ def test_premarket_scoring_contains_signal_block(monkeypatch) -> None:
     assert 1.0 <= cand["details"]["raw"]["market"] <= 10.0
     assert "newsSentiment" in signals
     assert "overnightProxy" in signals
+
+
+def test_premarket_overnight_proxy_is_reused_once(monkeypatch) -> None:
+    idx = pd.date_range("2025-10-01", periods=120, freq="B")
+    base = pd.DataFrame(
+        {
+            "Open": [100 + i * 0.2 for i in range(len(idx))],
+            "High": [101 + i * 0.2 for i in range(len(idx))],
+            "Low": [99 + i * 0.2 for i in range(len(idx))],
+            "Close": [100 + i * 0.2 for i in range(len(idx))],
+            "Volume": [1_500_000 for _ in range(len(idx))],
+        },
+        index=idx,
+    )
+    calls = {"count": 0}
+
+    def fake_proxy(session_date: str) -> float:
+        calls["count"] += 1
+        return 6.0
+
+    monkeypatch.setattr(scoring_service, "_download_frame", lambda ticker_symbol, start_date, end_date: base)
+    monkeypatch.setattr(
+        scoring_service,
+        "_build_universe",
+        lambda custom_tickers=None: {"005930.KS": "Samsung Electronics", "000660.KS": "SK Hynix"},
+    )
+    monkeypatch.setattr(scoring_service, "get_previous_trading_date", lambda target_date_str, max_lookback_days=14: "2026-02-19")
+    monkeypatch.setattr(scoring_service, "fetch_stock_news_items", lambda code, max_items=20: [])
+    monkeypatch.setattr(scoring_service, "_compute_overnight_proxy_score", fake_proxy)
+
+    payload = fetch_and_score_stocks(
+        date_str="2026-02-20",
+        strategy="premarket",
+        session_date_str="2026-02-20",
+        include_sparkline=False,
+    )
+    assert calls["count"] == 1
+    assert len(payload["candidates"]) == 2
+    for cand in payload["candidates"]:
+        assert cand["details"]["premarketSignals"]["overnightProxy"] == 6.0
+
+
+def test_intraday_scoring_contains_signal_block(monkeypatch) -> None:
+    idx = pd.date_range("2025-10-01", periods=120, freq="B")
+    base = pd.DataFrame(
+        {
+            "Open": [100 + i * 0.15 for i in range(len(idx))],
+            "High": [101 + i * 0.15 for i in range(len(idx))],
+            "Low": [99 + i * 0.15 for i in range(len(idx))],
+            "Close": [100 + i * 0.15 for i in range(len(idx))],
+            "Volume": [2_000_000 for _ in range(len(idx))],
+        },
+        index=idx,
+    )
+    monkeypatch.setattr(scoring_service, "_download_frame", lambda ticker_symbol, start_date, end_date: base)
+    monkeypatch.setattr(scoring_service, "_build_universe", lambda custom_tickers=None: {"005930.KS": "Samsung Electronics"})
+    monkeypatch.setattr(scoring_service, "INTRADAY_MODE", "proxy")
+    payload = fetch_and_score_stocks(
+        date_str="2026-02-20",
+        strategy="intraday",
+        session_date_str="2026-02-20",
+        include_sparkline=False,
+    )
+    assert payload["strategy"] == "intraday"
+    assert payload["candidates"]
+    cand = payload["candidates"][0]
+    signals = cand["details"]["intradaySignals"]
+    assert signals["mode"] == "proxy"
+    assert "orbProxyScore" in signals
+    assert "vwapProxyScore" in signals
+    assert "rvolScore" in signals
 
 
 def test_is_krx_trading_day_respects_external_calendar_holiday(monkeypatch) -> None:

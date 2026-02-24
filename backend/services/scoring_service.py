@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import os
 from datetime import date, datetime, time, timedelta
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -21,7 +22,7 @@ except Exception:  # pragma: no cover - optional dependency
 from services.news_service import fetch_stock_news_items
 from services.sparkline_service import build_sparkline60
 
-StrategyKind = Literal["premarket", "close"]
+StrategyKind = Literal["premarket", "close", "intraday"]
 
 TICKERS = {
     "005930.KS": "삼성전자",
@@ -188,7 +189,10 @@ REGIME_TO_WEIGHTS = {
 
 KST = ZoneInfo("Asia/Seoul")
 MARKET_PREMARKET_START_TIME = time(hour=8, minute=0)
+MARKET_INTRADAY_START_TIME = time(hour=9, minute=5)
+MARKET_INTRADAY_END_TIME = time(hour=15, minute=20)
 MARKET_CLOSE_TIME = time(hour=15, minute=30)
+INTRADAY_MODE = (os.getenv("INTRADAY_MODE", "proxy").strip().lower() or "proxy")
 
 _TRADING_DAY_CACHE: dict[str, bool] = {}
 _KRX_CALENDAR: Any | None = None
@@ -264,7 +268,16 @@ def normalize_weights(
 
 
 def get_latest_trading_date(target_date_str: str | None = None) -> str:
-    dt = datetime.strptime(target_date_str, "%Y-%m-%d") if target_date_str else datetime.today()
+    base_date = datetime.strptime(target_date_str, "%Y-%m-%d").date() if target_date_str else now_in_kst().date()
+    cursor = base_date
+    for _ in range(31):
+        iso = cursor.isoformat()
+        if is_krx_trading_day(iso):
+            return iso
+        cursor -= timedelta(days=1)
+
+    # Fallback to previous weekday when calendar probing is unavailable.
+    dt = datetime.combine(base_date, time.min)
     if dt.weekday() == 5:
         dt -= timedelta(days=1)
     elif dt.weekday() == 6:
@@ -452,6 +465,7 @@ def _base_status(
         "messages": {
             "premarket": "",
             "close": "",
+            "intraday": "",
         },
         "errorCode": None,
         "detail": None,
@@ -471,6 +485,7 @@ def get_strategy_status(requested_date_str: str | None, now_kst_value: datetime 
         status["detail"] = "날짜 형식은 YYYY-MM-DD 이어야 합니다."
         status["messages"]["premarket"] = status["detail"]
         status["messages"]["close"] = status["detail"]
+        status["messages"]["intraday"] = status["detail"]
         return status
 
     requested_date = target_date.isoformat()
@@ -482,6 +497,7 @@ def get_strategy_status(requested_date_str: str | None, now_kst_value: datetime 
         status["detail"] = msg
         status["messages"]["premarket"] = msg
         status["messages"]["close"] = msg
+        status["messages"]["intraday"] = msg
         return status
 
     if not is_krx_trading_day(requested_date):
@@ -491,6 +507,7 @@ def get_strategy_status(requested_date_str: str | None, now_kst_value: datetime 
         status["detail"] = msg
         status["messages"]["premarket"] = msg
         status["messages"]["close"] = msg
+        status["messages"]["intraday"] = msg
         status["nonTradingDay"] = non_trading_day
         return status
 
@@ -499,25 +516,45 @@ def get_strategy_status(requested_date_str: str | None, now_kst_value: datetime 
         status["defaultStrategy"] = "close"
         status["messages"]["premarket"] = "과거 거래일은 장전 전략 리플레이 조회가 가능합니다."
         status["messages"]["close"] = "과거 거래일은 종가 전략 리플레이 조회가 가능합니다."
+        status["messages"]["intraday"] = "장중 단타 전략은 당일 장중 시간(09:05~15:20 KST)에만 조회할 수 있습니다."
         return status
 
     now_time = now_kst_value.time()
     if now_time < MARKET_PREMARKET_START_TIME:
         status["messages"]["premarket"] = "장전 전략은 08:00(KST)부터 조회할 수 있습니다."
         status["messages"]["close"] = "종가 전략은 15:30(KST) 이후 조회할 수 있습니다."
+        status["messages"]["intraday"] = "장중 단타 전략은 09:05(KST)부터 15:20(KST)까지 조회할 수 있습니다."
+        return status
+
+    if now_time < MARKET_INTRADAY_START_TIME:
+        status["availableStrategies"] = ["premarket"]
+        status["defaultStrategy"] = "premarket"
+        status["messages"]["premarket"] = "현재 장전 전략 조회 가능 시간입니다."
+        status["messages"]["close"] = "종가 전략은 15:30(KST) 이후 조회할 수 있습니다."
+        status["messages"]["intraday"] = "장중 단타 전략은 09:05(KST)부터 조회할 수 있습니다."
+        return status
+
+    if now_time <= MARKET_INTRADAY_END_TIME:
+        status["availableStrategies"] = ["premarket", "intraday"]
+        status["defaultStrategy"] = "intraday"
+        status["messages"]["premarket"] = "당일 장전 전략 결과는 리플레이 조회가 가능합니다."
+        status["messages"]["close"] = "종가 전략은 15:30(KST) 이후 조회할 수 있습니다."
+        status["messages"]["intraday"] = "현재 장중 단타 전략 조회 가능 시간입니다."
         return status
 
     if now_time < MARKET_CLOSE_TIME:
         status["availableStrategies"] = ["premarket"]
         status["defaultStrategy"] = "premarket"
-        status["messages"]["premarket"] = "현재 장전 전략 조회 가능 시간입니다."
+        status["messages"]["premarket"] = "당일 장전 전략 결과는 리플레이 조회가 가능합니다."
         status["messages"]["close"] = "종가 전략은 15:30(KST) 이후 조회할 수 있습니다."
+        status["messages"]["intraday"] = "장중 단타 전략은 15:20(KST)에 마감되었습니다."
         return status
 
     status["availableStrategies"] = ["premarket", "close"]
     status["defaultStrategy"] = "close"
     status["messages"]["premarket"] = "당일 장전 전략 결과는 리플레이 조회가 가능합니다."
     status["messages"]["close"] = "현재 종가 전략 조회 가능 시간입니다."
+    status["messages"]["intraday"] = "장중 단타 전략은 15:20(KST)에 마감되었습니다."
     return status
 
 
@@ -531,9 +568,9 @@ def validate_strategy_request(
         return status
 
     strategy = (requested_strategy or "").strip().lower() if requested_strategy else None
-    if strategy and strategy not in {"premarket", "close"}:
+    if strategy and strategy not in {"premarket", "close", "intraday"}:
         status["errorCode"] = "INVALID_STRATEGY"
-        status["detail"] = "strategy 값은 premarket 또는 close 여야 합니다."
+        status["detail"] = "strategy 값은 premarket, intraday 또는 close 여야 합니다."
         return status
 
     selected = strategy or status.get("defaultStrategy")
@@ -552,7 +589,7 @@ def validate_strategy_request(
         return status
 
     session_date = str(status["requestedDate"])
-    signal_date = session_date if selected == "close" else get_previous_trading_date(session_date)
+    signal_date = get_previous_trading_date(session_date) if selected == "premarket" else session_date
 
     if requested_strategy:
         strategy_reason = f"explicit:{selected}"
@@ -776,6 +813,7 @@ def _apply_premarket_adjustments(
     tags: list[str],
     session_date: str,
     signal_date: str,
+    overnight_proxy: float | None = None,
 ) -> tuple[dict[str, float], dict[str, float], float, dict[str, Any], list[str]]:
     session_dt = datetime.strptime(session_date, "%Y-%m-%d")
     signal_dt = datetime.strptime(signal_date, "%Y-%m-%d")
@@ -788,12 +826,12 @@ def _apply_premarket_adjustments(
         window_end_kst=window_end,
     )
     news_sentiment = _compute_news_sentiment_score(titles)
-    overnight_proxy = _compute_overnight_proxy_score(session_date)
+    resolved_overnight_proxy = overnight_proxy if overnight_proxy is not None else _compute_overnight_proxy_score(session_date)
 
     adjusted_raw = {
         "return": _clamp_score((raw_scores["return"] * 0.65) + (news_sentiment * 0.35)),
         "stability": _clamp_score(raw_scores["stability"]),
-        "market": _clamp_score((raw_scores["market"] * 0.70) + (overnight_proxy * 0.30)),
+        "market": _clamp_score((raw_scores["market"] * 0.70) + (resolved_overnight_proxy * 0.30)),
     }
     adjusted_weighted = {
         "return": round(adjusted_raw["return"] * score_weights["return"], 3),
@@ -805,13 +843,89 @@ def _apply_premarket_adjustments(
     merged_tags = ["PREMARKET", *tags] if "PREMARKET" not in tags else tags[:]
     premarket_signals = {
         "newsSentiment": round(news_sentiment, 3),
-        "overnightProxy": round(overnight_proxy, 3),
+        "overnightProxy": round(resolved_overnight_proxy, 3),
         "newsWindowStart": window_start.isoformat(),
         "newsWindowEnd": window_end.isoformat(),
         "usedPrimaryWindow": used_primary_window,
         "analyzedNewsCount": len(titles),
     }
     return adjusted_raw, adjusted_weighted, total_score, premarket_signals, merged_tags
+
+
+def _compute_intraday_bars_signals(
+    *,
+    code: str,
+    session_date: str,
+) -> dict[str, float] | None:
+    # Phase 2 placeholder: replace with 5m ORB/VWAP/RVOL computation.
+    _ = (code, session_date)
+    return None
+
+
+def _apply_intraday_proxy_adjustments(
+    *,
+    code: str,
+    raw_scores: dict[str, float],
+    score_weights: dict[str, float],
+    tags: list[str],
+    open_price: float,
+    current_price: float,
+    day_high: float,
+    day_low: float,
+    today_volume: float,
+    avg_vol_20: float,
+    session_date: str,
+    mode: str,
+) -> tuple[dict[str, float], dict[str, float], float, dict[str, Any], list[str]]:
+    resolved_mode = mode if mode in {"proxy", "bars"} else "proxy"
+    bar_signals = _compute_intraday_bars_signals(code=code, session_date=session_date) if resolved_mode == "bars" else None
+
+    # Proxy fallback blends opening-range drift, proxy-VWAP deviation and relative volume.
+    range_span = max(day_high - day_low, max(current_price * 0.005, 1.0))
+    range_position = max(0.0, min(1.0, (current_price - day_low) / range_span))
+    open_drift_pct = ((current_price - open_price) / open_price) * 100 if open_price else 0.0
+    orb_proxy_score = _clamp_score(5.0 + (open_drift_pct * 1.4) + ((range_position - 0.5) * 5.0))
+
+    vwap_proxy_price = (day_high + day_low + current_price) / 3.0
+    vwap_dev_pct = ((current_price - vwap_proxy_price) / vwap_proxy_price) * 100 if vwap_proxy_price else 0.0
+    vwap_proxy_score = _clamp_score(5.0 + (vwap_dev_pct * 2.0))
+
+    rvol_ratio = today_volume / max(avg_vol_20, 1.0)
+    rvol_score = _clamp_score(5.0 + ((rvol_ratio - 1.0) * 3.0))
+
+    if bar_signals:
+        orb_proxy_score = _clamp_score(float(bar_signals.get("orbScore", orb_proxy_score)))
+        vwap_proxy_score = _clamp_score(float(bar_signals.get("vwapScore", vwap_proxy_score)))
+        rvol_score = _clamp_score(float(bar_signals.get("rvolScore", rvol_score)))
+        signal_mode = "bars"
+    else:
+        signal_mode = "proxy" if resolved_mode == "proxy" else "proxy-fallback"
+
+    adjusted_raw = {
+        "return": _clamp_score((raw_scores["return"] * 0.45) + (orb_proxy_score * 0.35) + (vwap_proxy_score * 0.20)),
+        "stability": _clamp_score((raw_scores["stability"] * 0.70) + ((10.0 - abs(vwap_proxy_score - 5.0)) * 0.30)),
+        "market": _clamp_score((raw_scores["market"] * 0.55) + (rvol_score * 0.45)),
+    }
+    adjusted_weighted = {
+        "return": round(adjusted_raw["return"] * score_weights["return"], 3),
+        "stability": round(adjusted_raw["stability"] * score_weights["stability"], 3),
+        "market": round(adjusted_raw["market"] * score_weights["market"], 3),
+    }
+    total_score = round(sum(adjusted_weighted.values()), 1)
+
+    intraday_signals = {
+        "mode": signal_mode,
+        "orbProxyScore": round(orb_proxy_score, 3),
+        "vwapProxyScore": round(vwap_proxy_score, 3),
+        "rvolScore": round(rvol_score, 3),
+        "openPrice": round(open_price, 3),
+        "dayHigh": round(day_high, 3),
+        "dayLow": round(day_low, 3),
+        "vwapProxyPrice": round(vwap_proxy_price, 3),
+        "rvolRatio": round(rvol_ratio, 3),
+    }
+    merged_tags = ["INTRADAY", *tags] if "INTRADAY" not in tags else tags[:]
+    return adjusted_raw, adjusted_weighted, total_score, intraday_signals, merged_tags
 
 
 def apply_sector_exposure_cap(
@@ -975,11 +1089,20 @@ def fetch_and_score_stocks(
     strategy: StrategyKind = "close",
     session_date_str: str | None = None,
 ) -> dict[str, Any]:
-    normalized_strategy: StrategyKind = "premarket" if str(strategy).lower() == "premarket" else "close"
+    strategy_value = str(strategy).lower()
+    if strategy_value == "premarket":
+        normalized_strategy: StrategyKind = "premarket"
+    elif strategy_value == "intraday":
+        normalized_strategy = "intraday"
+    else:
+        normalized_strategy = "close"
 
     if normalized_strategy == "premarket":
         session_date = session_date_str or date_str or now_in_kst().date().isoformat()
         signal_date = get_previous_trading_date(session_date)
+    elif normalized_strategy == "intraday":
+        session_date = session_date_str or date_str or now_in_kst().date().isoformat()
+        signal_date = session_date
     else:
         signal_date = get_latest_trading_date(date_str)
         session_date = session_date_str or signal_date
@@ -995,6 +1118,7 @@ def fetch_and_score_stocks(
 
     universe = _build_universe(custom_tickers=custom_tickers)
     overnight_proxy_cache = _compute_overnight_proxy_score(session_date) if normalized_strategy == "premarket" else None
+    intraday_mode = INTRADAY_MODE if INTRADAY_MODE in {"proxy", "bars"} else "proxy"
 
     for ticker_symbol, name in universe.items():
         try:
@@ -1006,6 +1130,7 @@ def fetch_and_score_stocks(
             volume = df["Volume"]
             high = df["High"]
             low = df["Low"]
+            open_ = df["Open"]
 
             current_price = float(close.iloc[-1])
             prev_price = float(close.iloc[-2]) if len(close) > 1 else current_price
@@ -1019,6 +1144,7 @@ def fetch_and_score_stocks(
             tags = ["Value"] if raw_scores["stability"] > 8 else (["TechnicalRebound"] if signals["rsi"] < 40 else ["Momentum"])
 
             premarket_signals: dict[str, Any] | None = None
+            intraday_signals: dict[str, Any] | None = None
             scoring_raw = raw_scores
             if normalized_strategy == "premarket":
                 adjusted_raw, adjusted_weighted, total_score, premarket_signals, tags = _apply_premarket_adjustments(
@@ -1028,9 +1154,25 @@ def fetch_and_score_stocks(
                     tags=tags,
                     session_date=session_date,
                     signal_date=signal_date,
+                    overnight_proxy=overnight_proxy_cache,
                 )
-                if overnight_proxy_cache is not None:
-                    premarket_signals["overnightProxy"] = round(float(overnight_proxy_cache), 3)
+                scoring_raw = adjusted_raw
+                weighted_scores = adjusted_weighted
+            elif normalized_strategy == "intraday":
+                adjusted_raw, adjusted_weighted, total_score, intraday_signals, tags = _apply_intraday_proxy_adjustments(
+                    code=code,
+                    raw_scores=raw_scores,
+                    score_weights=score_weights,
+                    tags=tags,
+                    open_price=float(open_.iloc[-1]),
+                    current_price=current_price,
+                    day_high=float(high.iloc[-1]),
+                    day_low=float(low.iloc[-1]),
+                    today_volume=float(volume.iloc[-1]),
+                    avg_vol_20=float(signals.get("avgVol20", 0.0)),
+                    session_date=session_date,
+                    mode=intraday_mode,
+                )
                 scoring_raw = adjusted_raw
                 weighted_scores = adjusted_weighted
             else:
@@ -1056,6 +1198,13 @@ def fetch_and_score_stocks(
                 summary = (
                     f"장전 합성 신호(뉴스={premarket_signals['newsSentiment']:.1f}, "
                     f"야간프록시={premarket_signals['overnightProxy']:.1f}). "
+                    f"{summary}"
+                )
+            elif normalized_strategy == "intraday" and intraday_signals is not None:
+                summary = (
+                    f"장중 단타 신호(ORB={intraday_signals['orbProxyScore']:.1f}, "
+                    f"VWAP={intraday_signals['vwapProxyScore']:.1f}, "
+                    f"RVOL={intraday_signals['rvolScore']:.1f}, mode={intraday_signals['mode']}). "
                     f"{summary}"
                 )
 
@@ -1086,6 +1235,8 @@ def fetch_and_score_stocks(
             }
             if premarket_signals is not None:
                 candidate_payload["details"]["premarketSignals"] = premarket_signals
+            if intraday_signals is not None:
+                candidate_payload["details"]["intradaySignals"] = intraday_signals
 
             candidates.append(candidate_payload)
         except Exception:

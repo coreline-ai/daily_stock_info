@@ -33,6 +33,7 @@ from services.scoring_service import (
     get_trading_calendar_runtime_status,
     get_market_indices,
     get_market_overview,
+    now_in_kst,
     normalize_weights,
     validate_strategy_request,
     validate_recommendation_request_date,
@@ -74,6 +75,16 @@ class WatchlistRequest(BaseModel):
 def _build_cache_key(prefix: str, **kwargs: Any) -> str:
     ordered = "&".join(f"{k}={kwargs[k]}" for k in sorted(kwargs.keys()))
     return f"{prefix}:{ordered}"
+
+
+def _intraday_cache_bucket(strategy: str, session_date: str) -> str:
+    if strategy != "intraday":
+        return ""
+    now = now_in_kst()
+    if session_date != now.date().isoformat():
+        return ""
+    floored = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+    return floored.strftime("%Y%m%d%H%M")
 
 
 def _is_candidate_cache_valid(candidates: Any) -> bool:
@@ -453,6 +464,7 @@ def market_overview(
         date=effective_date,
         session_date=session_date,
         strategy=resolved_strategy,
+        intraday_bucket=_intraday_cache_bucket(resolved_strategy, session_date),
         user_key=user_key,
         custom=",".join(sorted(resolved_custom)),
     )
@@ -518,6 +530,7 @@ def stock_candidates(
         date=effective_date,
         session_date=session_date,
         strategy=resolved_strategy,
+        intraday_bucket=_intraday_cache_bucket(resolved_strategy, session_date),
         user_key=user_key,
         custom=",".join(sorted(resolved_custom)),
         w_return=weights["return"],

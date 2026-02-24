@@ -18,6 +18,7 @@ const PRESETS = {
 
 const STRATEGY_LABEL: Record<StrategyKind, string> = {
   premarket: "장전 전략",
+  intraday: "장중 단타",
   close: "종가 전략",
 };
 
@@ -70,6 +71,27 @@ function deriveOverviewCounts(candidates: StockCandidate[]) {
   return { up, down, steady: Math.max(0, candidates.length - up - down) };
 }
 
+function getTodayInKstIsoDate(): string {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Seoul",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const parts = formatter.formatToParts(new Date());
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  if (!year || !month || !day) {
+    return new Date().toISOString().split("T")[0];
+  }
+  return `${year}-${month}-${day}`;
+}
+
+function detailKey(code: string, strategy: StrategyKind): string {
+  return `${strategy}:${code}`;
+}
+
 async function readApiError(response: Response): Promise<string> {
   const fallback = `API 요청 실패 (${response.status})`;
   try {
@@ -108,7 +130,7 @@ const ProgressBar = ({ label, score, colorClass }: { label: string; score: numbe
 };
 
 export default function Home() {
-  const today = useMemo(() => new Date().toISOString().split("T")[0], []);
+  const today = useMemo(() => getTodayInKstIsoDate(), []);
   const [selectedDate, setSelectedDate] = useState(today);
   const [effectiveDate, setEffectiveDate] = useState(today);
   const [strategyStatus, setStrategyStatus] = useState<StrategyStatus | null>(null);
@@ -127,12 +149,18 @@ export default function Home() {
 
   const [marketInfo, setMarketInfo] = useState<MarketOverview | null>(null);
   const [candidates, setCandidates] = useState<StockCandidate[]>([]);
+  const [intradayExtraCandidates, setIntradayExtraCandidates] = useState<StockCandidate[]>([]);
+  const [showIntradayExtra, setShowIntradayExtra] = useState(true);
+  const [intradayExtraError, setIntradayExtraError] = useState<string | null>(null);
   const [insight, setInsight] = useState<MarketInsight | null>(null);
   const [expandedRow, setExpandedRow] = useState<string | null>(null);
   const [detailData, setDetailData] = useState<Record<string, StockDetail>>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const safeCandidates = (Array.isArray(candidates) ? candidates : []).filter(
+    (candidate): candidate is StockCandidate => !!candidate && typeof candidate === "object",
+  );
+  const safeIntradayExtraCandidates = (Array.isArray(intradayExtraCandidates) ? intradayExtraCandidates : []).filter(
     (candidate): candidate is StockCandidate => !!candidate && typeof candidate === "object",
   );
   const safeWeights = sanitizeWeights(weights);
@@ -143,10 +171,12 @@ export default function Home() {
   }, [watchlist, customInput]);
   const customTickersQuery = useMemo(() => resolvedCustomTickers.join(","), [resolvedCustomTickers]);
   const availableStrategies = strategyStatus?.availableStrategies ?? [];
+  const intradayAvailable = availableStrategies.includes("intraday");
   const strategyMessage = selectedStrategy
     ? strategyStatus?.messages?.[selectedStrategy] ?? ""
-    : strategyStatus?.detail ?? strategyStatus?.messages?.premarket ?? strategyStatus?.messages?.close ?? "";
+    : strategyStatus?.detail ?? strategyStatus?.messages?.premarket ?? strategyStatus?.messages?.intraday ?? strategyStatus?.messages?.close ?? "";
   const nonTradingDay = strategyStatus?.errorCode === "NON_TRADING_DAY" ? strategyStatus?.nonTradingDay ?? null : null;
+  const shouldLoadIntradayExtra = Boolean(showIntradayExtra && intradayAvailable && selectedStrategy !== "intraday");
 
   const fetchWatchlist = async () => {
     try {
@@ -199,6 +229,8 @@ export default function Home() {
   useEffect(() => {
     setDetailData({});
     setExpandedRow(null);
+    setIntradayExtraCandidates([]);
+    setIntradayExtraError(null);
   }, [
     selectedDate,
     selectedStrategy,
@@ -209,6 +241,7 @@ export default function Home() {
     enforceExposureCap,
     maxPerSector,
     customTickersQuery,
+    showIntradayExtra,
   ]);
 
   useEffect(() => {
@@ -217,16 +250,25 @@ export default function Home() {
         setLoading(false);
         setMarketInfo(null);
         setCandidates([]);
+        setIntradayExtraCandidates([]);
+        setIntradayExtraError(null);
         setInsight(null);
         setEffectiveDate(selectedDate);
         if (strategyStatus) {
-          setError(strategyStatus.detail ?? strategyStatus.messages?.premarket ?? strategyStatus.messages?.close ?? "조회 가능한 전략이 없습니다.");
+          setError(
+            strategyStatus.detail ??
+              strategyStatus.messages?.premarket ??
+              strategyStatus.messages?.intraday ??
+              strategyStatus.messages?.close ??
+              "조회 가능한 전략이 없습니다.",
+          );
         }
         return;
       }
 
       setLoading(true);
       setError(null);
+      setIntradayExtraError(null);
       try {
         const common = new URLSearchParams({
           date: selectedDate,
@@ -270,10 +312,30 @@ export default function Home() {
         setMarketInfo(syncedOverview);
         setCandidates(cands);
         setInsight((await insightRes.json()) as MarketInsight);
+
+        if (shouldLoadIntradayExtra) {
+          const intradayQuery = new URLSearchParams(common);
+          intradayQuery.set("strategy", "intraday");
+          intradayQuery.set("include_sparkline", "true");
+          const intradayRes = await fetch(`${API_BASE}/api/v1/stock-candidates?${intradayQuery.toString()}`);
+          if (!intradayRes.ok) {
+            setIntradayExtraCandidates([]);
+            setIntradayExtraError(await readApiError(intradayRes));
+          } else {
+            const intradayPayload = (await intradayRes.json()) as unknown;
+            setIntradayExtraCandidates(toCandidateArray(intradayPayload).slice(0, 5));
+            setIntradayExtraError(null);
+          }
+        } else {
+          setIntradayExtraCandidates([]);
+          setIntradayExtraError(null);
+        }
       } catch (fetchError) {
         console.error(fetchError);
         setMarketInfo(null);
         setCandidates([]);
+        setIntradayExtraCandidates([]);
+        setIntradayExtraError(null);
         setInsight(null);
         setEffectiveDate(selectedDate);
         setError(fetchError instanceof Error ? fetchError.message : "데이터를 불러오지 못했습니다.");
@@ -293,6 +355,7 @@ export default function Home() {
     enforceExposureCap,
     maxPerSector,
     customTickersQuery,
+    shouldLoadIntradayExtra,
   ]);
 
   const handleWeight = (key: "return" | "stability" | "market", value: number) => {
@@ -355,19 +418,20 @@ export default function Home() {
     setAutoRegimeWeights(false);
   };
 
-  const toggleExpand = async (code: string) => {
-    if (!selectedStrategy) {
+  const toggleExpand = async (code: string, strategy: StrategyKind) => {
+    if (!strategy) {
       return;
     }
-    if (expandedRow === code) {
+    const key = detailKey(code, strategy);
+    if (expandedRow === key) {
       setExpandedRow(null);
       return;
     }
-    setExpandedRow(code);
-    if (!detailData[code]) {
+    setExpandedRow(key);
+    if (!detailData[key]) {
       const q = new URLSearchParams({
         date: selectedDate,
-        strategy: selectedStrategy,
+        strategy,
         w_return: String(safeWeights.return),
         w_stability: String(safeWeights.stability),
         w_market: String(safeWeights.market),
@@ -381,7 +445,7 @@ export default function Home() {
         const res = await fetch(`${API_BASE}/api/v1/stocks/${code}/detail?${q}`);
         if (!res.ok) throw new Error("detail fetch failed");
         const data = (await res.json()) as StockDetail;
-        setDetailData((prev) => ({ ...prev, [code]: data }));
+        setDetailData((prev) => ({ ...prev, [key]: data }));
       } catch (detailError) {
         console.error(detailError);
       }
@@ -443,6 +507,16 @@ export default function Home() {
             {nonTradingDay.calendarProvider ? ` | 캘린더: ${nonTradingDay.calendarProvider}` : ""}
           </div>
         )}
+        {showIntradayExtra && !intradayAvailable && (
+          <div className="text-xs rounded border border-sky-700/40 bg-sky-950/30 p-2 text-sky-200">
+            장중 단타 추가 추천은 당일 장중(09:05~15:20 KST)에만 노출됩니다.
+          </div>
+        )}
+        {showIntradayExtra && intradayExtraError && (
+          <div className="text-xs rounded border border-red-700/40 bg-red-950/30 p-2 text-red-200">
+            장중 단타 추가 추천 로드 실패: {intradayExtraError}
+          </div>
+        )}
 
         <section className="bg-color-card border border-color-card-border rounded-lg p-4 space-y-3">
           <div className="flex flex-wrap items-center gap-2">
@@ -491,6 +565,10 @@ export default function Home() {
                 <option value={2}>2</option>
                 <option value={3}>3</option>
               </select>
+            </label>
+            <label className="flex items-center gap-1">
+              <input type="checkbox" checked={Boolean(showIntradayExtra)} onChange={(e) => setShowIntradayExtra(e.target.checked)} />
+              장중 단타 추가 추천 표시
             </label>
           </div>
         </section>
@@ -607,6 +685,144 @@ export default function Home() {
             )}
           </section>
 
+          {showIntradayExtra && safeIntradayExtraCandidates.length > 0 && (
+            <section>
+              <h2 className="text-lg font-bold mb-2">장중 단타 추가 추천</h2>
+              <div className="border border-color-card-border rounded overflow-hidden">
+                <div className="grid grid-cols-[40px_1fr_90px_90px_110px_90px_44px] gap-2 px-3 py-2 text-xs bg-[#1c2128] text-color-muted">
+                  <span>#</span>
+                  <span>종목</span>
+                  <span className="text-right">점수</span>
+                  <span className="text-right">등락률</span>
+                  <span className="text-center">섹터</span>
+                  <span className="text-center">스파크</span>
+                  <span />
+                </div>
+                {safeIntradayExtraCandidates.map((cand, idx) => {
+                  const rowStrategy: StrategyKind = "intraday";
+                  const rowKey = detailKey(cand.code, rowStrategy);
+                  const detail = detailData[rowKey];
+                  const score = Number(cand.score ?? 0);
+                  const changeRate = Number(cand.changeRate ?? 0);
+                  const price = Number(cand.price ?? 0);
+                  const targetPrice = Number(cand.targetPrice ?? 0);
+                  const stopLoss = Number(cand.stopLoss ?? 0);
+                  const rawReturn = Number(cand.details?.raw?.return ?? 0);
+                  const rawStability = Number(cand.details?.raw?.stability ?? 0);
+                  const rawMarket = Number(cand.details?.raw?.market ?? 0);
+                  const weightedReturn = Number(cand.details?.weighted?.return ?? 0);
+                  const weightedStability = Number(cand.details?.weighted?.stability ?? 0);
+                  const weightedMarket = Number(cand.details?.weighted?.market ?? 0);
+                  return (
+                    <div key={`intraday-${cand.code}-${cand.rank ?? idx}`} className="border-t border-[#2d333b] bg-[#111827]">
+                      <button
+                        className="w-full grid grid-cols-[40px_1fr_90px_90px_110px_90px_44px] gap-2 px-3 py-3 items-center text-left hover:bg-white/5"
+                        onClick={() => toggleExpand(cand.code, rowStrategy)}
+                      >
+                        <span className="text-sm font-bold text-blue-300">{cand.rank}</span>
+                        <span>
+                          <div className="font-semibold">{cand.name}</div>
+                          <div className="text-xs text-color-muted">{cand.code}</div>
+                        </span>
+                        <span className="text-right text-sky-300">{score.toFixed(1)}</span>
+                        <span className={`text-right ${changeRate > 0 ? "text-red-400" : changeRate < 0 ? "text-blue-400" : "text-gray-400"}`}>
+                          {changeRate > 0 ? "+" : ""}
+                          {changeRate}%
+                        </span>
+                        <span className="text-center text-xs">
+                          <span className="px-2 py-1 rounded bg-[#1e293b] border border-[#334155]">{cand.sector ?? "-"}</span>
+                          {cand.exposureDeferred && <span className="block text-[10px] text-amber-300 mt-1">캡 적용</span>}
+                        </span>
+                        <span className="flex justify-center">
+                          <Sparkline points={cand.sparkline60} />
+                        </span>
+                        <span className="text-center text-color-muted">{expandedRow === rowKey ? "v" : ">"}</span>
+                      </button>
+
+                      {expandedRow === rowKey && (
+                        <div className="px-4 pb-4 grid gap-4">
+                          <div className="text-sm bg-black/30 rounded p-3 border border-white/10">
+                            <strong className="text-blue-300">AI 요약</strong> {detail?.aiReport?.summary ?? cand.summary}
+                          </div>
+                          <div className="grid md:grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                              <ProgressBar label="Raw Return" score={rawReturn} colorClass="bg-blue-500" />
+                              <ProgressBar label="Raw Stability" score={rawStability} colorClass="bg-emerald-500" />
+                              <ProgressBar label="Raw Market" score={rawMarket} colorClass="bg-amber-500" />
+                            </div>
+                            <div className="bg-[#1f2937]/50 rounded p-3 text-sm space-y-1 border border-[#334155]">
+                              <div>현재가: {detail?.currentPrice?.toLocaleString() ?? price.toLocaleString()} KRW</div>
+                              <div>목표가: {detail?.targetPrice?.toLocaleString() ?? targetPrice.toLocaleString()} KRW</div>
+                              <div>손절가: {detail?.stopLoss?.toLocaleString() ?? stopLoss.toLocaleString()} KRW</div>
+                              <div>예상 수익률: {detail?.expectedReturn ?? 0}%</div>
+                              <div>섹터: {detail?.sector ?? cand.sector ?? "-"}</div>
+                              <div className="text-xs text-color-muted">
+                                가중 점수: R {weightedReturn.toFixed(2)} / S {weightedStability.toFixed(2)} / M {weightedMarket.toFixed(2)}
+                              </div>
+                              {cand.details?.intradaySignals && (
+                                <div className="text-xs text-color-muted border border-[#334155] rounded p-2 bg-[#0b1220]">
+                                  <div>장중 모드: {cand.details.intradaySignals.mode}</div>
+                                  <div>ORB: {Number(cand.details.intradaySignals.orbProxyScore ?? 0).toFixed(2)}</div>
+                                  <div>VWAP: {Number(cand.details.intradaySignals.vwapProxyScore ?? 0).toFixed(2)}</div>
+                                  <div>RVOL: {Number(cand.details.intradaySignals.rvolScore ?? 0).toFixed(2)}</div>
+                                </div>
+                              )}
+                              {detail?.positionSizing && (
+                                <div className="text-xs mt-2 border border-[#334155] rounded p-2 bg-[#111827]">
+                                  <div>매수 수량: {detail.positionSizing.shares.toLocaleString()}</div>
+                                  <div>필요 자금: {detail.positionSizing.capitalRequired.toLocaleString()} KRW</div>
+                                  <div>위험 금액: {detail.positionSizing.riskAmount.toLocaleString()} KRW</div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="grid md:grid-cols-2 gap-4">
+                            <div className="bg-[#0f172a] p-3 rounded border border-[#1e293b]">
+                              <h3 className="text-xs text-color-muted mb-2">주요 뉴스 3줄</h3>
+                              <ul className="text-sm space-y-1 list-disc list-inside">
+                                {(detail?.newsSummary3 ?? ["뉴스를 불러오는 중...", "", ""]).map((line, i) => (
+                                  <li key={`${cand.code}-intraday-summary-${i}`}>{line}</li>
+                                ))}
+                              </ul>
+                              <div className="flex gap-2 mt-2 flex-wrap">
+                                {(detail?.themes ?? []).map((theme) => (
+                                  <span key={`${cand.code}-intraday-theme-${theme}`} className="text-xs px-2 py-1 rounded bg-[#1e293b] border border-[#334155]">
+                                    #{theme}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                            <div className="bg-[#0f172a] p-3 rounded border border-[#1e293b]">
+                              <h3 className="text-xs text-color-muted mb-2">LLM 결론</h3>
+                              <p className="text-sm">{detail?.aiReport?.conclusion ?? "리포트 생성 중..."}</p>
+                              <ul className="mt-2 text-xs list-disc list-inside text-color-muted">
+                                {(detail?.aiReport?.riskFactors ?? []).map((rf) => (
+                                  <li key={`${cand.code}-intraday-${rf.id}`}>{rf.description}</li>
+                                ))}
+                              </ul>
+                              {detail?.aiReport?.confidence && (
+                                <div className="mt-2 text-xs border border-[#334155] rounded p-2 bg-[#111827]">
+                                  <div>신뢰도: {detail.aiReport.confidence.score} ({detail.aiReport.confidence.level})</div>
+                                  {(Array.isArray(detail.aiReport.confidence.warnings) ? detail.aiReport.confidence.warnings : []).map((w, idx2) => (
+                                    <div key={`${cand.code}-intraday-warn-${idx2}`} className="text-amber-300">- {w}</div>
+                                  ))}
+                                </div>
+                              )}
+                              {detail?.aiReport?.fallbackReason && (
+                                <div className="mt-2 text-xs text-amber-200">대체 문구 사용: {detail.aiReport.fallbackReason}</div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </section>
+          )}
+
           <section>
             <h2 className="text-lg font-bold mb-2">
               추천 종목 {selectedStrategy ? `(${STRATEGY_LABEL[selectedStrategy]})` : ""}
@@ -622,7 +838,9 @@ export default function Home() {
                 <span />
               </div>
               {safeCandidates.map((cand, idx) => {
-                const detail = detailData[cand.code];
+                const rowStrategy = (cand.strategy ?? selectedStrategy ?? "close") as StrategyKind;
+                const rowKey = detailKey(cand.code, rowStrategy);
+                const detail = detailData[rowKey];
                 const score = Number(cand.score ?? 0);
                 const changeRate = Number(cand.changeRate ?? 0);
                 const price = Number(cand.price ?? 0);
@@ -636,7 +854,7 @@ export default function Home() {
                 const weightedMarket = Number(cand.details?.weighted?.market ?? 0);
                 return (
                   <div key={`${cand.code}-${cand.rank ?? idx}`} className="border-t border-[#2d333b] bg-[#111827]">
-                    <button className="w-full grid grid-cols-[40px_1fr_90px_90px_110px_90px_44px] gap-2 px-3 py-3 items-center text-left hover:bg-white/5" onClick={() => toggleExpand(cand.code)}>
+                    <button className="w-full grid grid-cols-[40px_1fr_90px_90px_110px_90px_44px] gap-2 px-3 py-3 items-center text-left hover:bg-white/5" onClick={() => toggleExpand(cand.code, rowStrategy)}>
                       <span className="text-sm font-bold text-blue-300">{cand.rank}</span>
                       <span>
                         <div className="font-semibold">{cand.name}</div>
@@ -654,10 +872,10 @@ export default function Home() {
                       <span className="flex justify-center">
                         <Sparkline points={cand.sparkline60} />
                       </span>
-                      <span className="text-center text-color-muted">{expandedRow === cand.code ? "v" : ">"}</span>
+                      <span className="text-center text-color-muted">{expandedRow === rowKey ? "v" : ">"}</span>
                     </button>
 
-                    {expandedRow === cand.code && (
+                    {expandedRow === rowKey && (
                       <div className="px-4 pb-4 grid gap-4">
                         <div className="text-sm bg-black/30 rounded p-3 border border-white/10">
                           <strong className="text-blue-300">AI 요약</strong> {detail?.aiReport?.summary ?? cand.summary}
@@ -682,6 +900,14 @@ export default function Home() {
                                 <div>장전 뉴스 감성: {Number(cand.details.premarketSignals.newsSentiment ?? 0).toFixed(2)}</div>
                                 <div>야간 프록시: {Number(cand.details.premarketSignals.overnightProxy ?? 0).toFixed(2)}</div>
                                 <div>뉴스 집계 구간: {cand.details.premarketSignals.newsWindowStart} ~ {cand.details.premarketSignals.newsWindowEnd}</div>
+                              </div>
+                            )}
+                            {cand.details?.intradaySignals && (
+                              <div className="text-xs text-color-muted border border-[#334155] rounded p-2 bg-[#0b1220]">
+                                <div>장중 모드: {cand.details.intradaySignals.mode}</div>
+                                <div>ORB: {Number(cand.details.intradaySignals.orbProxyScore ?? 0).toFixed(2)}</div>
+                                <div>VWAP: {Number(cand.details.intradaySignals.vwapProxyScore ?? 0).toFixed(2)}</div>
+                                <div>RVOL: {Number(cand.details.intradaySignals.rvolScore ?? 0).toFixed(2)}</div>
                               </div>
                             )}
                             {detail?.positionSizing && (

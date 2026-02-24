@@ -3,7 +3,7 @@ export interface Warning {
   message: string;
 }
 
-export type StrategyKind = "premarket" | "close";
+export type StrategyKind = "premarket" | "intraday" | "close";
 
 export interface StrategyStatus {
   timezone: string;
@@ -13,6 +13,7 @@ export interface StrategyStatus {
   defaultStrategy: StrategyKind | null;
   messages: {
     premarket: string;
+    intraday: string;
     close: string;
   };
   errorCode?: string | null;
@@ -94,6 +95,17 @@ export interface StockCandidate {
       newsWindowEnd: string;
       usedPrimaryWindow: boolean;
       analyzedNewsCount: number;
+    };
+    intradaySignals?: {
+      mode: string;
+      orbProxyScore: number;
+      vwapProxyScore: number;
+      rvolScore: number;
+      openPrice: number;
+      dayHigh: number;
+      dayLow: number;
+      vwapProxyPrice: number;
+      rvolRatio: number;
     };
   };
   realDate?: string;

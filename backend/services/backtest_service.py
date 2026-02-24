@@ -8,7 +8,13 @@ from sqlalchemy import and_, func, select
 
 from db.models import BacktestResult, RecommendationSnapshot
 from db.session import session_scope
-from services.scoring_service import DEFAULT_WEIGHTS, fetch_and_score_stocks, get_price_series_for_ticker, resolve_company_name
+from services.scoring_service import (
+    DEFAULT_WEIGHTS,
+    fetch_and_score_stocks,
+    get_price_series_for_ticker,
+    is_krx_trading_day,
+    resolve_company_name,
+)
 
 
 def compute_forward_returns(close: pd.Series, trade_date: str) -> dict[str, float | None]:
@@ -43,13 +49,14 @@ def _daterange(start_date: str, end_date: str) -> list[str]:
     end = datetime.strptime(end_date, "%Y-%m-%d")
     out: list[str] = []
     while start <= end:
-        if start.weekday() < 5:
-            out.append(start.strftime("%Y-%m-%d"))
+        day = start.strftime("%Y-%m-%d")
+        if start.weekday() < 5 and is_krx_trading_day(day):
+            out.append(day)
         start += timedelta(days=1)
     return out
 
 
-def _upsert_snapshot(session, trade_date: str, candidate: dict[str, Any]) -> None:
+def _upsert_snapshot(session, trade_date: str, candidate: dict[str, Any]) -> bool:
     d = datetime.strptime(trade_date, "%Y-%m-%d").date()
     existing = session.scalar(
         select(RecommendationSnapshot).where(
@@ -68,7 +75,7 @@ def _upsert_snapshot(session, trade_date: str, candidate: dict[str, Any]) -> Non
         existing.stop_loss = float(candidate["stopLoss"])
         existing.tags = candidate.get("tags", [])
         existing.sparkline60 = candidate.get("sparkline60", [])
-        return
+        return False
 
     session.add(
         RecommendationSnapshot(
@@ -86,9 +93,10 @@ def _upsert_snapshot(session, trade_date: str, candidate: dict[str, Any]) -> Non
             sparkline60=candidate.get("sparkline60", []),
         )
     )
+    return True
 
 
-def _upsert_backtest(session, trade_date: str, candidate: dict[str, Any]) -> None:
+def _upsert_backtest(session, trade_date: str, candidate: dict[str, Any]) -> bool:
     d = datetime.strptime(trade_date, "%Y-%m-%d").date()
     close_series = get_price_series_for_ticker(candidate["code"], trade_date=trade_date, future_days=7)
     returns = compute_forward_returns(close_series, trade_date=trade_date)
@@ -103,7 +111,7 @@ def _upsert_backtest(session, trade_date: str, candidate: dict[str, Any]) -> Non
         existing.ret_t1 = returns["ret_t1"]
         existing.ret_t3 = returns["ret_t3"]
         existing.ret_t5 = returns["ret_t5"]
-        return
+        return False
 
     session.add(
         BacktestResult(
@@ -115,6 +123,7 @@ def _upsert_backtest(session, trade_date: str, candidate: dict[str, Any]) -> Non
             ret_t5=returns["ret_t5"],
         )
     )
+    return True
 
 
 def backfill_snapshots(start_date: str, end_date: str) -> int:
@@ -125,9 +134,10 @@ def backfill_snapshots(start_date: str, end_date: str) -> int:
         top5 = scored["candidates"][:5]
         with session_scope() as session:
             for candidate in top5:
-                _upsert_snapshot(session, trade_date, candidate)
-                _upsert_backtest(session, trade_date, candidate)
-                inserted += 1
+                snapshot_inserted = _upsert_snapshot(session, trade_date, candidate)
+                backtest_inserted = _upsert_backtest(session, trade_date, candidate)
+                if snapshot_inserted or backtest_inserted:
+                    inserted += 1
     return inserted
 
 
