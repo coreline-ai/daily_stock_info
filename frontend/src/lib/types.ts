@@ -16,6 +16,18 @@ export interface StrategyStatus {
     intraday: string;
     close: string;
   };
+  strategyAdvisories?: Partial<
+    Record<
+      StrategyKind,
+      {
+        recommended: boolean;
+        gateStatus: "pass" | "warn" | "fail";
+        mode: string;
+        reason: string;
+        intradaySignalBranch?: "baseline" | "phase2" | string | null;
+      }
+    >
+  >;
   errorCode?: string | null;
   detail?: string | null;
   nonTradingDay?: {
@@ -65,6 +77,8 @@ export interface StockCandidate {
   tags: string[];
   sector?: string;
   exposureDeferred?: boolean;
+  strongRecommendation?: boolean;
+  validationPenalty?: number;
   summary: string;
   sparkline60: number[];
   appliedWeights?: {
@@ -98,6 +112,7 @@ export interface StockCandidate {
     };
     intradaySignals?: {
       mode: string;
+      signalBranch?: "baseline" | "phase2" | string;
       orbProxyScore: number;
       vwapProxyScore: number;
       rvolScore: number;
@@ -106,9 +121,99 @@ export interface StockCandidate {
       dayLow: number;
       vwapProxyPrice: number;
       rvolRatio: number;
+      orbHigh?: number;
+      orbLow?: number;
+      vwapPrice?: number;
+      inPlayScore?: number;
+      intradayMomentumScore?: number;
+      overnightReversalScore?: number;
+      rvolProfileRatio?: number;
+      overnightReturnPct?: number;
+      intradayReturnPct?: number;
+    };
+    validation?: {
+      gatePassed: boolean;
+      gateStatus: "pass" | "warn" | "fail";
+      insufficientData: boolean;
+      pbo: number;
+      dsr: number;
+      netSharpe: number;
+      asOfDate: string;
+      mode: string;
     };
   };
   realDate?: string;
+}
+
+export interface StrategyValidationResponse {
+  strategy: StrategyKind;
+  requestedDate?: string | null;
+  asOfDate: string;
+  mode: string;
+  gateStatus: "pass" | "warn" | "fail";
+  gatePassed: boolean;
+  insufficientData: boolean;
+  validationPenalty: number;
+  thresholds: {
+    pboMax: number;
+    dsrMin: number;
+    sampleSizeMin: number;
+    netSharpeMin: number;
+  };
+  protocol: {
+    trainSessions: number;
+    testSessions: number;
+    embargoSessions: number;
+    costBps: number;
+    windows: number;
+    intradaySignalBranch?: "baseline" | "phase2" | string;
+  };
+  metrics: {
+    netSharpe: number;
+    maxDrawdown: number;
+    hitRate: number;
+    turnover: number;
+    pbo: number;
+    dsr: number;
+    sampleSize: number;
+  };
+  weights?: {
+    return: number;
+    stability: number;
+    market: number;
+  };
+  customTickers?: string[];
+  branchComparison?: {
+    baseline: {
+      gateStatus: "pass" | "warn" | "fail";
+      netSharpe: number;
+      pbo: number;
+      dsr: number;
+      sampleSize: number;
+    };
+    phase2: {
+      gateStatus: "pass" | "warn" | "fail";
+      netSharpe: number;
+      pbo: number;
+      dsr: number;
+      sampleSize: number;
+    };
+    recommendedBranch: "baseline" | "phase2";
+    selectedBranch: "baseline" | "phase2" | string;
+  };
+  monitoring?: {
+    logged: boolean;
+    alerts: string[];
+  };
+}
+
+export interface WebVitalPayload {
+  id: string;
+  name: "FCP" | "LCP" | "CLS" | "INP" | "TTFB" | string;
+  value: number;
+  rating: "good" | "needs-improvement" | "poor" | string;
+  path: string;
+  ts: number;
 }
 
 export interface MarketInsight {
@@ -129,6 +234,8 @@ export interface AiReport {
   conclusion: string;
   riskFactors: { id: string; description: string }[];
   fallbackReason?: string;
+  promptVersion?: string;
+  promptHash?: string;
   confidence?: {
     score: number;
     level: "high" | "medium" | "low";
@@ -196,6 +303,10 @@ export interface BacktestHistoryItem {
   tradeDate: string;
   ticker: string;
   companyName?: string;
+  dayOpen?: number | null;
+  dayClose?: number | null;
+  currentPrice?: number | null;
+  currentPriceDate?: string | null;
   entryPrice: number;
   retT1: number | null;
   retT3: number | null;

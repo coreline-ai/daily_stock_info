@@ -12,7 +12,9 @@ from services.scoring_service import (
     DEFAULT_WEIGHTS,
     fetch_and_score_stocks,
     get_price_series_for_ticker,
+    get_trade_day_ohlc_for_ticker,
     is_krx_trading_day,
+    now_in_kst,
     resolve_company_name,
 )
 
@@ -237,9 +239,57 @@ def get_backtest_history(
         total = session.scalar(total_query) or 0
         rows = session.scalars(data_query.offset(offset).limit(size)).all()
 
-    items = [
-        {
-            "tradeDate": r.trade_date.isoformat(),
+    ohlc_cache: dict[tuple[str, str], dict[str, float | None]] = {}
+    current_price_cache: dict[str, dict[str, float | str | None]] = {}
+    today_str = now_in_kst().strftime("%Y-%m-%d")
+
+    def _resolve_ohlc(trade_date: str, ticker: str, entry_price: float) -> dict[str, float]:
+        key = (trade_date, ticker)
+        if key not in ohlc_cache:
+            ohlc_cache[key] = get_trade_day_ohlc_for_ticker(ticker, trade_date)
+        ohlc = ohlc_cache[key]
+        open_price = float(ohlc.get("open")) if ohlc.get("open") is not None else float(entry_price)
+        close_price = float(ohlc.get("close")) if ohlc.get("close") is not None else float(entry_price)
+        return {"dayOpen": round(open_price, 4), "dayClose": round(close_price, 4)}
+
+    def _resolve_current_price(ticker: str) -> dict[str, float | str | None]:
+        cached = current_price_cache.get(ticker)
+        if cached is not None:
+            return cached
+        try:
+            close_series = get_price_series_for_ticker(ticker, trade_date=today_str, future_days=0)
+            if close_series.empty:
+                current = {"currentPrice": None, "currentPriceDate": None}
+                current_price_cache[ticker] = current
+                return current
+            close_series = close_series.sort_index()
+            last_price = float(close_series.iloc[-1]) if pd.notna(close_series.iloc[-1]) else None
+            idx_value = close_series.index[-1]
+            as_of_date = (
+                idx_value.date().isoformat()
+                if hasattr(idx_value, "date")
+                else pd.Timestamp(idx_value).date().isoformat()
+            )
+            current = {
+                "currentPrice": round(last_price, 4) if last_price is not None else None,
+                "currentPriceDate": as_of_date,
+            }
+            current_price_cache[ticker] = current
+            return current
+        except Exception:
+            current = {"currentPrice": None, "currentPriceDate": None}
+            current_price_cache[ticker] = current
+            return current
+
+    def _build_item(r: BacktestResult) -> dict[str, Any]:
+        trade_date = r.trade_date.isoformat()
+        ohlc = _resolve_ohlc(trade_date, r.ticker, r.entry_price)
+        current = _resolve_current_price(r.ticker)
+        if current.get("currentPrice") is None:
+            # Fallback when live/latest quote fetch is unavailable (e.g., vendor rate-limit).
+            current = {"currentPrice": ohlc["dayClose"], "currentPriceDate": trade_date}
+        return {
+            "tradeDate": trade_date,
             "ticker": r.ticker,
             "companyName": resolve_company_name(r.ticker),
             "entryPrice": r.entry_price,
@@ -249,9 +299,11 @@ def get_backtest_history(
             "netRetT1": _net_return(r.ret_t1, fee_bps=fee_bps, slippage_bps=slippage_bps),
             "netRetT3": _net_return(r.ret_t3, fee_bps=fee_bps, slippage_bps=slippage_bps),
             "netRetT5": _net_return(r.ret_t5, fee_bps=fee_bps, slippage_bps=slippage_bps),
+            **ohlc,
+            **current,
         }
-        for r in rows
-    ]
+
+    items = [_build_item(r) for r in rows]
     return {
         "items": items,
         "page": page,

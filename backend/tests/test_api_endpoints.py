@@ -365,6 +365,7 @@ def test_strategy_status_endpoint(monkeypatch) -> None:
             "nonTradingDay": None,
         },
     )
+    monkeypatch.setattr(api_main, "_build_strategy_advisories", lambda requested_date, available_strategies: {})
     client = TestClient(api_main.app)
     res = client.get("/api/v1/strategy-status?date=2026-02-20")
     assert res.status_code == 200
@@ -392,10 +393,42 @@ def test_strategy_status_non_trading_day_details(monkeypatch) -> None:
             },
         },
     )
+    monkeypatch.setattr(api_main, "_build_strategy_advisories", lambda requested_date, available_strategies: {})
     client = TestClient(api_main.app)
     res = client.get("/api/v1/strategy-status?date=2026-02-17")
     assert res.status_code == 200
     assert res.json()["nonTradingDay"]["holidayName"] == "설날"
+
+
+def test_strategy_status_includes_advisories(monkeypatch) -> None:
+    monkeypatch.setattr(
+        api_main,
+        "get_strategy_status",
+        lambda requested_date_str: {
+            "timezone": "Asia/Seoul",
+            "nowKst": "2026-02-20T10:10:00+0900",
+            "requestedDate": "2026-02-20",
+            "availableStrategies": ["intraday", "premarket"],
+            "defaultStrategy": "intraday",
+            "messages": {"premarket": "ok", "intraday": "ok", "close": "locked"},
+            "errorCode": None,
+            "detail": None,
+            "nonTradingDay": None,
+        },
+    )
+    monkeypatch.setattr(
+        api_main,
+        "_build_strategy_advisories",
+        lambda requested_date, available_strategies: {
+            "intraday": {"recommended": False, "gateStatus": "fail", "mode": "hard", "reason": "검증 기준 미달(하드 게이트)"},
+            "premarket": {"recommended": True, "gateStatus": "pass", "mode": "soft", "reason": "ok"},
+        },
+    )
+    client = TestClient(api_main.app)
+    res = client.get("/api/v1/strategy-status?date=2026-02-20")
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload["strategyAdvisories"]["intraday"]["recommended"] is False
 
 
 def test_strategy_guard_error_shape(monkeypatch) -> None:
@@ -418,3 +451,315 @@ def test_intraday_cache_bucket_rounds_5_minutes(monkeypatch) -> None:
     monkeypatch.setattr(api_main, "now_in_kst", lambda: datetime(2026, 2, 20, 10, 7, 31, tzinfo=ZoneInfo("Asia/Seoul")))
     bucket = api_main._intraday_cache_bucket("intraday", "2026-02-20")
     assert bucket == "202602201005"
+
+
+def test_strategy_validation_endpoint(monkeypatch) -> None:
+    monkeypatch.setattr(api_main, "get_latest_trading_date", lambda date: "2026-02-20")
+    monkeypatch.setattr(api_main, "_get_watchlist_tickers", lambda user_key: [])
+    monkeypatch.setattr(
+        api_main,
+        "run_walk_forward_validation",
+        lambda strategy, universe, params, as_of_date: {
+            "strategy": strategy,
+            "asOfDate": as_of_date,
+            "mode": "soft",
+            "gateStatus": "warn",
+            "gatePassed": False,
+            "insufficientData": False,
+            "validationPenalty": 0.3,
+            "thresholds": {"pboMax": 0.2, "dsrMin": 0.0, "sampleSizeMin": 60, "netSharpeMin": 0.5},
+            "protocol": {"trainSessions": 126, "testSessions": 21, "embargoSessions": 1, "costBps": 20.0, "windows": 2},
+            "metrics": {"netSharpe": 0.42, "maxDrawdown": -3.0, "hitRate": 51.0, "turnover": 31.0, "pbo": 0.24, "dsr": -0.05, "sampleSize": 70},
+            "monitoring": {"logged": True, "alerts": ["pbo>0.30"]},
+        },
+    )
+    api_main._CACHE.clear()
+    client = TestClient(api_main.app)
+    res = client.get("/api/v1/strategy-validation?strategy=intraday&date=2026-02-20")
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload["strategy"] == "intraday"
+    assert payload["asOfDate"] == "2026-02-20"
+    assert payload["metrics"]["sampleSize"] == 70
+    assert payload["monitoring"]["logged"] is True
+
+
+def test_strategy_validation_endpoint_includes_branch_comparison(monkeypatch) -> None:
+    monkeypatch.setattr(api_main, "get_latest_trading_date", lambda date: "2026-02-20")
+    monkeypatch.setattr(api_main, "_get_watchlist_tickers", lambda user_key: [])
+    monkeypatch.setattr(
+        api_main,
+        "run_walk_forward_validation",
+        lambda strategy, universe, params, as_of_date: {
+            "strategy": strategy,
+            "asOfDate": as_of_date,
+            "mode": "soft",
+            "gateStatus": "pass",
+            "gatePassed": True,
+            "insufficientData": False,
+            "validationPenalty": 0.0,
+            "thresholds": {"pboMax": 0.2, "dsrMin": 0.0, "sampleSizeMin": 60, "netSharpeMin": 0.5},
+            "protocol": {"trainSessions": 126, "testSessions": 21, "embargoSessions": 1, "costBps": 20.0, "windows": 2, "intradaySignalBranch": "phase2"},
+            "metrics": {"netSharpe": 0.8, "maxDrawdown": -2.0, "hitRate": 55.0, "turnover": 25.0, "pbo": 0.1, "dsr": 0.2, "sampleSize": 80},
+            "monitoring": {"logged": True, "alerts": []},
+            "branchComparison": {
+                "baseline": {"gateStatus": "warn", "netSharpe": 0.4, "pbo": 0.22, "dsr": -0.03, "sampleSize": 80},
+                "phase2": {"gateStatus": "pass", "netSharpe": 0.8, "pbo": 0.1, "dsr": 0.2, "sampleSize": 80},
+                "recommendedBranch": "phase2",
+                "selectedBranch": "phase2",
+            },
+        },
+    )
+    api_main._CACHE.clear()
+    client = TestClient(api_main.app)
+    res = client.get("/api/v1/strategy-validation?strategy=intraday&date=2026-02-20&compare_branches=true&intraday_signal_branch=phase2")
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload["branchComparison"]["recommendedBranch"] == "phase2"
+    assert payload["branchComparison"]["selectedBranch"] == "phase2"
+
+
+def test_strategy_validation_etag_304(monkeypatch) -> None:
+    monkeypatch.setattr(api_main, "get_latest_trading_date", lambda date: "2026-02-20")
+    monkeypatch.setattr(api_main, "_get_watchlist_tickers", lambda user_key: [])
+    monkeypatch.setattr(
+        api_main,
+        "run_walk_forward_validation",
+        lambda strategy, universe, params, as_of_date: {
+            "strategy": strategy,
+            "asOfDate": as_of_date,
+            "mode": "soft",
+            "gateStatus": "pass",
+            "gatePassed": True,
+            "insufficientData": False,
+            "validationPenalty": 0.0,
+            "thresholds": {"pboMax": 0.2, "dsrMin": 0.0, "sampleSizeMin": 60, "netSharpeMin": 0.5},
+            "protocol": {"trainSessions": 126, "testSessions": 21, "embargoSessions": 1, "costBps": 20.0, "windows": 2},
+            "metrics": {"netSharpe": 0.8, "maxDrawdown": -2.0, "hitRate": 55.0, "turnover": 25.0, "pbo": 0.1, "dsr": 0.2, "sampleSize": 80},
+            "monitoring": {"logged": True, "alerts": []},
+        },
+    )
+    client = TestClient(api_main.app)
+    first = client.get("/api/v1/strategy-validation?strategy=intraday&date=2026-02-20")
+    assert first.status_code == 200
+    etag = first.headers.get("etag")
+    assert etag
+    second = client.get("/api/v1/strategy-validation?strategy=intraday&date=2026-02-20", headers={"If-None-Match": etag})
+    assert second.status_code == 304
+
+
+def test_stock_candidates_include_validation_block(monkeypatch) -> None:
+    def fake_fetch(
+        date_str=None,
+        weights=None,
+        include_sparkline=True,
+        strategy="close",
+        session_date_str=None,
+        custom_tickers=None,
+        enforce_exposure_cap=False,
+        max_per_sector=2,
+        cap_top_n=5,
+        **kwargs,
+    ):
+        return _mock_candidates(weights)
+
+    monkeypatch.setattr(api_main, "fetch_and_score_stocks", fake_fetch)
+    monkeypatch.setattr(api_main, "_get_watchlist_tickers", lambda user_key: [])
+    monkeypatch.setattr(
+        api_main,
+        "run_walk_forward_validation",
+        lambda strategy, universe, params, as_of_date: {
+            "strategy": strategy,
+            "asOfDate": as_of_date,
+            "mode": "soft",
+            "gateStatus": "warn",
+            "gatePassed": False,
+            "insufficientData": False,
+            "validationPenalty": 0.3,
+            "thresholds": {"pboMax": 0.2, "dsrMin": 0.0, "sampleSizeMin": 60, "netSharpeMin": 0.5},
+            "protocol": {"trainSessions": 126, "testSessions": 21, "embargoSessions": 1, "costBps": 20.0, "windows": 2},
+            "metrics": {"netSharpe": 0.42, "maxDrawdown": -3.0, "hitRate": 51.0, "turnover": 31.0, "pbo": 0.24, "dsr": -0.05, "sampleSize": 70},
+        },
+    )
+    _allow_strategy_guard(monkeypatch, strategy="intraday")
+    api_main._CACHE.clear()
+    client = TestClient(api_main.app)
+    res = client.get("/api/v1/stock-candidates?date=2026-02-20&strategy=intraday&w_return=0.4&w_stability=0.3&w_market=0.3")
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload[0]["details"]["validation"]["gateStatus"] == "warn"
+    assert payload[0]["validationPenalty"] == 0.3
+    assert payload[0]["score"] == 7.7
+
+
+def test_stock_candidates_forwards_intraday_signal_branch(monkeypatch) -> None:
+    captured: dict[str, str | None] = {"branch": None}
+
+    def fake_fetch(
+        date_str=None,
+        weights=None,
+        include_sparkline=True,
+        strategy="close",
+        session_date_str=None,
+        custom_tickers=None,
+        enforce_exposure_cap=False,
+        max_per_sector=2,
+        cap_top_n=5,
+        **kwargs,
+    ):
+        captured["branch"] = kwargs.get("intraday_signal_branch")
+        return _mock_candidates(weights)
+
+    monkeypatch.setattr(api_main, "fetch_and_score_stocks", fake_fetch)
+    monkeypatch.setattr(api_main, "_get_watchlist_tickers", lambda user_key: [])
+    monkeypatch.setattr(
+        api_main,
+        "run_walk_forward_validation",
+        lambda strategy, universe, params, as_of_date: {
+            "strategy": strategy,
+            "asOfDate": as_of_date,
+            "mode": "soft",
+            "gateStatus": "pass",
+            "gatePassed": True,
+            "insufficientData": False,
+            "validationPenalty": 0.0,
+            "thresholds": {"pboMax": 0.2, "dsrMin": 0.0, "sampleSizeMin": 60, "netSharpeMin": 0.5},
+            "protocol": {"trainSessions": 126, "testSessions": 21, "embargoSessions": 1, "costBps": 20.0, "windows": 2, "intradaySignalBranch": "baseline"},
+            "metrics": {"netSharpe": 0.8, "maxDrawdown": -2.0, "hitRate": 55.0, "turnover": 25.0, "pbo": 0.1, "dsr": 0.2, "sampleSize": 80},
+        },
+    )
+    _allow_strategy_guard(monkeypatch, strategy="intraday")
+    api_main._CACHE.clear()
+    client = TestClient(api_main.app)
+    res = client.get(
+        "/api/v1/stock-candidates?date=2026-02-20&strategy=intraday&w_return=0.4&w_stability=0.3&w_market=0.3&intraday_signal_branch=baseline"
+    )
+    assert res.status_code == 200
+    assert captured["branch"] == "baseline"
+
+
+def test_stock_candidates_auto_branch_rollout(monkeypatch) -> None:
+    captured: dict[str, str | None] = {"branch": None}
+
+    def fake_fetch(
+        date_str=None,
+        weights=None,
+        include_sparkline=True,
+        strategy="close",
+        session_date_str=None,
+        custom_tickers=None,
+        enforce_exposure_cap=False,
+        max_per_sector=2,
+        cap_top_n=5,
+        **kwargs,
+    ):
+        captured["branch"] = kwargs.get("intraday_signal_branch")
+        return _mock_candidates(weights)
+
+    monkeypatch.setattr(api_main, "INTRADAY_BRANCH_ROLLOUT_MODE", "auto")
+    monkeypatch.setattr(api_main, "resolve_intraday_branch_by_validation", lambda as_of_date, universe, params: "baseline")
+    monkeypatch.setattr(api_main, "fetch_and_score_stocks", fake_fetch)
+    monkeypatch.setattr(api_main, "_get_watchlist_tickers", lambda user_key: [])
+    monkeypatch.setattr(
+        api_main,
+        "run_walk_forward_validation",
+        lambda strategy, universe, params, as_of_date: {
+            "strategy": strategy,
+            "asOfDate": as_of_date,
+            "mode": "soft",
+            "gateStatus": "pass",
+            "gatePassed": True,
+            "insufficientData": False,
+            "validationPenalty": 0.0,
+            "thresholds": {"pboMax": 0.2, "dsrMin": 0.0, "sampleSizeMin": 60, "netSharpeMin": 0.5},
+            "protocol": {"trainSessions": 126, "testSessions": 21, "embargoSessions": 1, "costBps": 20.0, "windows": 2, "intradaySignalBranch": "baseline"},
+            "metrics": {"netSharpe": 0.8, "maxDrawdown": -2.0, "hitRate": 55.0, "turnover": 25.0, "pbo": 0.1, "dsr": 0.2, "sampleSize": 80},
+        },
+    )
+    _allow_strategy_guard(monkeypatch, strategy="intraday")
+    api_main._CACHE.clear()
+    client = TestClient(api_main.app)
+    res = client.get("/api/v1/stock-candidates?date=2026-02-20&strategy=intraday&w_return=0.4&w_stability=0.3&w_market=0.3")
+    assert res.status_code == 200
+    assert captured["branch"] == "baseline"
+
+
+def test_stock_candidates_order_unchanged_when_validation_penalty_zero(monkeypatch) -> None:
+    def fake_fetch(
+        date_str=None,
+        weights=None,
+        include_sparkline=True,
+        strategy="close",
+        session_date_str=None,
+        custom_tickers=None,
+        enforce_exposure_cap=False,
+        max_per_sector=2,
+        cap_top_n=5,
+        **kwargs,
+    ):
+        return _mock_candidates(weights)
+
+    monkeypatch.setattr(api_main, "fetch_and_score_stocks", fake_fetch)
+    monkeypatch.setattr(api_main, "_get_watchlist_tickers", lambda user_key: [])
+    monkeypatch.setattr(
+        api_main,
+        "run_walk_forward_validation",
+        lambda strategy, universe, params, as_of_date: {
+            "strategy": strategy,
+            "asOfDate": as_of_date,
+            "mode": "soft",
+            "gateStatus": "pass",
+            "gatePassed": True,
+            "insufficientData": False,
+            "validationPenalty": 0.0,
+            "thresholds": {"pboMax": 0.2, "dsrMin": 0.0, "sampleSizeMin": 60, "netSharpeMin": 0.5},
+            "protocol": {"trainSessions": 126, "testSessions": 21, "embargoSessions": 1, "costBps": 20.0, "windows": 2},
+            "metrics": {"netSharpe": 0.8, "maxDrawdown": -2.0, "hitRate": 55.0, "turnover": 25.0, "pbo": 0.1, "dsr": 0.2, "sampleSize": 80},
+        },
+    )
+    _allow_strategy_guard(monkeypatch, strategy="intraday")
+    api_main._CACHE.clear()
+    client = TestClient(api_main.app)
+    res = client.get("/api/v1/stock-candidates?date=2026-02-20&strategy=intraday&w_return=0.4&w_stability=0.3&w_market=0.3")
+    assert res.status_code == 200
+    payload = res.json()
+    assert payload[0]["code"] == "005930"
+    assert payload[1]["code"] == "000660"
+    assert payload[0]["score"] == 8.0
+
+
+def test_telemetry_web_vitals_success(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "vitals.jsonl"
+    monkeypatch.setattr(api_main, "_WEB_VITALS_LOG_PATH", log_path)
+    client = TestClient(api_main.app)
+    res = client.post(
+        "/api/v1/telemetry/web-vitals",
+        json={
+            "id": "v1",
+            "name": "INP",
+            "value": 120.5,
+            "rating": "good",
+            "path": "/",
+            "ts": 1730000000000,
+        },
+    )
+    assert res.status_code == 200
+    assert res.json()["ok"] is True
+    assert log_path.exists()
+    assert "INP" in log_path.read_text(encoding="utf-8")
+
+
+def test_telemetry_web_vitals_rejects_unknown_metric() -> None:
+    client = TestClient(api_main.app)
+    res = client.post(
+        "/api/v1/telemetry/web-vitals",
+        json={
+            "id": "v2",
+            "name": "XYZ",
+            "value": 10,
+            "rating": "good",
+            "path": "/",
+            "ts": 1730000000001,
+        },
+    )
+    assert res.status_code == 400

@@ -4,15 +4,20 @@ import csv
 import hashlib
 import io
 import json
+import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from dotenv import load_dotenv
 
 from db.models import AIReport, BacktestResult, UserWatchlist
 from db.session import init_db, is_db_enabled, session_scope
@@ -29,6 +34,7 @@ from services.scoring_service import (
     TICKERS,
     detect_market_regime,
     fetch_and_score_stocks,
+    get_latest_trading_date,
     get_strategy_status,
     get_trading_calendar_runtime_status,
     get_market_indices,
@@ -38,6 +44,10 @@ from services.scoring_service import (
     validate_strategy_request,
     validate_recommendation_request_date,
 )
+from services.validation_service import run_walk_forward_validation
+from services.validation_service import resolve_intraday_branch_by_validation
+
+load_dotenv(Path(__file__).with_name(".env"), override=False)
 
 
 @asynccontextmanager
@@ -51,15 +61,86 @@ app = FastAPI(title="DailyStock AI API", version="2.1.0", lifespan=lifespan)
 
 _CACHE: Dict[str, Any] = {}
 _WATCHLIST: Dict[str, set[str]] = {}
-_MIN_CANDIDATE_CACHE_COUNT = max(6, int(len(TICKERS) * 0.75))
+try:
+    _cache_min_count_env = int(os.getenv("CANDIDATE_CACHE_MIN_COUNT", "12"))
+except ValueError:
+    _cache_min_count_env = 12
+_MIN_CANDIDATE_CACHE_COUNT = max(5, min(len(TICKERS), _cache_min_count_env))
+_ROLLOUT_MODE_ENV = (os.getenv("INTRADAY_BRANCH_ROLLOUT_MODE", "manual").strip().lower() or "manual")
+INTRADAY_BRANCH_ROLLOUT_MODE = _ROLLOUT_MODE_ENV if _ROLLOUT_MODE_ENV in {"manual", "auto"} else "manual"
+_origin_raw = os.getenv(
+    "FRONTEND_ALLOWED_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:3001,http://127.0.0.1:3001",
+)
+_ALLOWED_ORIGINS = [entry.strip() for entry in _origin_raw.split(",") if entry.strip()]
+_origin_regex_raw = os.getenv("FRONTEND_ALLOWED_ORIGIN_REGEX", r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
+_ALLOWED_ORIGIN_REGEX = re.compile(_origin_regex_raw) if _origin_regex_raw else None
+_ENABLE_HSTS = (os.getenv("ENABLE_HSTS", "").strip().lower() == "true")
+_WEB_VITALS_LOG_PATH = Path(os.getenv("WEB_VITALS_LOG_PATH", "/tmp/daily_stock_web_vitals.jsonl"))
+_INTRADAY_FORCE_REFRESH_SYMBOL_LIMIT = max(5, int(os.getenv("INTRADAY_FORCE_REFRESH_SYMBOL_LIMIT", "12")))
+_VALIDATION_COMPUTE_ON_REQUEST = (os.getenv("VALIDATION_COMPUTE_ON_REQUEST", "true").strip().lower() == "true")
+_ETAG_PATHS = {
+    "/api/v1/market-overview",
+    "/api/v1/stock-candidates",
+    "/api/v1/strategy-validation",
+}
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_origin_regex=(_origin_regex_raw or None),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:3000 http://localhost:8000 https:; "
+        "font-src 'self' data:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+    )
+    if _ENABLE_HSTS:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+    return response
+
+
+@app.middleware("http")
+async def etag_middleware(request: Request, call_next):
+    if request.method != "GET" or request.url.path not in _ETAG_PATHS:
+        return await call_next(request)
+
+    response = await call_next(request)
+    if response.status_code >= 400:
+        return response
+
+    body = b""
+    async for chunk in response.body_iterator:
+        body += chunk
+
+    etag = hashlib.md5(body).hexdigest()
+    if_none_match = request.headers.get("if-none-match", "").strip("\"")
+    headers = dict(response.headers)
+    headers["ETag"] = f"\"{etag}\""
+    headers.setdefault("Cache-Control", "public, max-age=30, stale-while-revalidate=120")
+    headers.pop("content-length", None)
+
+    if if_none_match and if_none_match == etag:
+        headers.pop("content-type", None)
+        return Response(status_code=304, headers=headers)
+    return Response(
+        content=body,
+        status_code=response.status_code,
+        headers=headers,
+        media_type=response.media_type,
+    )
 
 
 class BackfillRequest(BaseModel):
@@ -72,9 +153,30 @@ class WatchlistRequest(BaseModel):
     tickers: list[str] = Field(default_factory=list)
 
 
+class WebVitalRequest(BaseModel):
+    id: str
+    name: str
+    value: float
+    rating: str
+    path: str
+    ts: int
+
+
 def _build_cache_key(prefix: str, **kwargs: Any) -> str:
     ordered = "&".join(f"{k}={kwargs[k]}" for k in sorted(kwargs.keys()))
     return f"{prefix}:{ordered}"
+
+
+def _require_trusted_origin(request: Request) -> None:
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin:
+        return
+    if origin in _ALLOWED_ORIGINS:
+        return
+    if _ALLOWED_ORIGIN_REGEX and _ALLOWED_ORIGIN_REGEX.match(origin):
+        return
+    if origin not in _ALLOWED_ORIGINS:
+        raise HTTPException(status_code=403, detail="허용되지 않은 Origin 입니다.")
 
 
 def _intraday_cache_bucket(strategy: str, session_date: str) -> str:
@@ -85,6 +187,39 @@ def _intraday_cache_bucket(strategy: str, session_date: str) -> str:
         return ""
     floored = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
     return floored.strftime("%Y%m%d%H%M")
+
+
+def _normalize_intraday_signal_branch(value: str | None) -> str | None:
+    if value is None:
+        return None
+    branch = value.strip().lower()
+    return branch if branch in {"baseline", "phase2"} else None
+
+
+def _resolve_effective_intraday_signal_branch(
+    *,
+    strategy: str,
+    requested_branch: str | None,
+    as_of_date: str,
+    custom_tickers: list[str],
+    weights: dict[str, float],
+) -> str | None:
+    if strategy != "intraday":
+        return None
+    normalized_requested = _normalize_intraday_signal_branch(requested_branch)
+    if normalized_requested:
+        return normalized_requested
+    if INTRADAY_BRANCH_ROLLOUT_MODE != "auto":
+        return None
+    return resolve_intraday_branch_by_validation(
+        as_of_date=as_of_date,
+        universe=custom_tickers,
+        params={
+            "w_return": weights["return"],
+            "w_stability": weights["stability"],
+            "w_market": weights["market"],
+        },
+    )
 
 
 def _is_candidate_cache_valid(candidates: Any) -> bool:
@@ -102,6 +237,8 @@ def _fetch_candidates_best_effort(
     enforce_exposure_cap: bool,
     max_per_sector: int,
     cap_top_n: int,
+    intraday_signal_branch: str | None = None,
+    restrict_symbols: list[str] | None = None,
     attempts: int = 2,
 ) -> dict[str, Any]:
     best_payload: dict[str, Any] | None = None
@@ -116,6 +253,8 @@ def _fetch_candidates_best_effort(
             enforce_exposure_cap=enforce_exposure_cap,
             max_per_sector=max_per_sector,
             cap_top_n=cap_top_n,
+            intraday_signal_branch=intraday_signal_branch,
+            restrict_symbols=restrict_symbols,
         )
         if best_payload is None or len(payload["candidates"]) > len(best_payload["candidates"]):
             best_payload = payload
@@ -160,6 +299,16 @@ def _parse_ticker_csv(raw: Optional[str]) -> list[str]:
         return []
     items = [t.strip().upper() for t in raw.split(",")]
     return [item for item in items if item]
+
+
+def _symbol_from_code(code: str) -> str | None:
+    normalized = (code or "").strip().upper().replace(".KS", "").replace(".KQ", "")
+    if not normalized:
+        return None
+    for symbol in TICKERS.keys():
+        if symbol.upper().replace(".KS", "").replace(".KQ", "") == normalized:
+            return symbol
+    return None
 
 
 def _normalize_input_ticker(ticker: str) -> str:
@@ -337,6 +486,7 @@ def _find_candidate(
     strategy: str,
     session_date: str,
     custom_tickers: list[str],
+    intraday_signal_branch: str | None,
 ) -> tuple[dict[str, Any], str]:
     payload = fetch_and_score_stocks(
         date_str=date,
@@ -346,11 +496,195 @@ def _find_candidate(
         session_date_str=session_date,
         custom_tickers=custom_tickers,
         enforce_exposure_cap=False,
+        intraday_signal_branch=intraday_signal_branch,
     )
     for candidate in payload["candidates"]:
         if candidate["code"] == ticker:
             return candidate, payload["date"]
     raise HTTPException(status_code=404, detail="현재 분석 후보에서 해당 종목을 찾을 수 없습니다.")
+
+
+def _resolve_strategy_validation(
+    *,
+    strategy: str,
+    as_of_date: str,
+    custom_tickers: list[str],
+    weights: dict[str, float],
+    intraday_signal_branch: str | None = None,
+    compare_branches: bool = False,
+    compute_if_missing: bool = True,
+) -> dict[str, Any]:
+    cache_key = _build_cache_key(
+        "strategy_validation",
+        strategy=strategy,
+        as_of_date=as_of_date,
+        custom=",".join(sorted(custom_tickers)),
+        w_return=weights["return"],
+        w_stability=weights["stability"],
+        w_market=weights["market"],
+        intraday_signal_branch=(intraday_signal_branch or ""),
+        compare_branches=compare_branches,
+    )
+    cached = _CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        return cached
+    if not compute_if_missing:
+        return {}
+    summary = run_walk_forward_validation(
+        strategy=strategy,
+        universe=custom_tickers,
+        params={
+            "w_return": weights["return"],
+            "w_stability": weights["stability"],
+            "w_market": weights["market"],
+            "intradaySignalBranch": intraday_signal_branch,
+            "compareBranches": compare_branches,
+        },
+        as_of_date=as_of_date,
+    )
+    _CACHE[cache_key] = summary
+    return summary
+
+
+def _build_strategy_advisories(
+    *,
+    requested_date: str,
+    available_strategies: list[str],
+) -> dict[str, Any]:
+    if not available_strategies:
+        return {}
+
+    weights = normalize_weights(DEFAULT_WEIGHTS["return"], DEFAULT_WEIGHTS["stability"], DEFAULT_WEIGHTS["market"])
+    as_of_date = get_latest_trading_date(requested_date)
+    advisories: dict[str, Any] = {}
+    for strategy_name in available_strategies:
+        effective_branch = _resolve_effective_intraday_signal_branch(
+            strategy=strategy_name,
+            requested_branch=None,
+            as_of_date=as_of_date,
+            custom_tickers=[],
+            weights=weights,
+        )
+        summary = _resolve_strategy_validation(
+            strategy=strategy_name,
+            as_of_date=as_of_date,
+            custom_tickers=[],
+            weights=weights,
+            intraday_signal_branch=effective_branch,
+            compare_branches=(strategy_name == "intraday" and INTRADAY_BRANCH_ROLLOUT_MODE == "auto"),
+            compute_if_missing=False,
+        )
+        if not summary:
+            advisories[strategy_name] = {
+                "recommended": True,
+                "gateStatus": "warn",
+                "mode": "observe",
+                "reason": "검증 데이터 계산 중(캐시 준비 전)",
+                "intradaySignalBranch": effective_branch,
+            }
+            continue
+        mode = str(summary.get("mode", "soft"))
+        gate_status = str(summary.get("gateStatus", "warn"))
+        recommended = not (mode == "hard" and gate_status == "fail")
+        advisories[strategy_name] = {
+            "recommended": recommended,
+            "gateStatus": gate_status,
+            "mode": mode,
+            "reason": "검증 기준 미달(하드 게이트)" if not recommended else "검증 기준 충족 또는 소프트 게이트",
+            "intradaySignalBranch": effective_branch,
+        }
+    return advisories
+
+
+def _attach_validation_to_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    validation_summary: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not validation_summary:
+        return [dict(item) for item in candidates]
+
+    metrics = validation_summary.get("metrics", {}) if isinstance(validation_summary.get("metrics"), dict) else {}
+    penalty = float(validation_summary.get("validationPenalty", 0.0) or 0.0)
+
+    out: list[dict[str, Any]] = []
+    for candidate in candidates:
+        item = dict(candidate)
+        details = dict(item.get("details", {}))
+        details["validation"] = {
+            "gatePassed": bool(validation_summary.get("gatePassed", False)),
+            "gateStatus": str(validation_summary.get("gateStatus", "warn")),
+            "insufficientData": bool(validation_summary.get("insufficientData", False)),
+            "pbo": float(metrics.get("pbo", 1.0) or 1.0),
+            "dsr": float(metrics.get("dsr", 0.0) or 0.0),
+            "netSharpe": float(metrics.get("netSharpe", 0.0) or 0.0),
+            "asOfDate": str(validation_summary.get("asOfDate", "")),
+            "mode": str(validation_summary.get("mode", "soft")),
+        }
+        if penalty > 0:
+            item["validationPenalty"] = round(penalty, 4)
+            item["score"] = round(float(item.get("score", 0.0)) - penalty, 1)
+        item["details"] = details
+        out.append(item)
+    return out
+
+
+def _strip_validation_annotations(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stripped: list[dict[str, Any]] = []
+    for candidate in candidates:
+        item = dict(candidate)
+        item.pop("validationPenalty", None)
+        details = dict(item.get("details", {}))
+        if "validation" in details:
+            details.pop("validation", None)
+        item["details"] = details
+        stripped.append(item)
+    return stripped
+
+
+def _apply_intraday_force_refresh_rotation(
+    *,
+    candidates: list[dict[str, Any]],
+    user_key: str,
+    session_date: str,
+    top_n: int,
+    refresh_token: str | None = None,
+) -> list[dict[str, Any]]:
+    if not candidates:
+        return candidates
+    previous_key = _build_cache_key("intraday_force_last", user_key=user_key, session_date=session_date)
+    previous_codes = _CACHE.get(previous_key)
+    previous_list = [str(code) for code in previous_codes] if isinstance(previous_codes, list) else []
+    previous_set = set(previous_list)
+
+    adjusted: list[dict[str, Any]] = []
+    for candidate in candidates:
+        item = dict(candidate)
+        if str(item.get("code", "")) in previous_set:
+            # Penalize immediately repeated picks a little so adjacent alternatives can surface.
+            item["score"] = round(float(item.get("score", 0.0)) - 0.25, 3)
+        adjusted.append(item)
+
+    adjusted.sort(key=lambda x: float(x.get("score", 0.0)), reverse=True)
+    current_top = [str(item.get("code", "")) for item in adjusted[: max(1, top_n)]]
+    token_text = refresh_token.strip() if isinstance(refresh_token, str) else ""
+    if len(adjusted) > max(1, top_n):
+        swap_from = max(1, top_n) - 1
+        swap_to = max(1, top_n)
+        if token_text:
+            seed = int(hashlib.md5(token_text.encode("utf-8")).hexdigest(), 16)
+            extra = len(adjusted) - max(1, top_n)
+            swap_to = max(1, top_n) + (seed % max(1, extra))
+        elif previous_list and current_top == previous_list[: max(1, top_n)]:
+            swap_to = max(1, top_n)
+        adjusted[swap_from], adjusted[swap_to] = adjusted[swap_to], adjusted[swap_from]
+
+    for idx, item in enumerate(adjusted):
+        item["rank"] = idx + 1
+        item["strongRecommendation"] = idx < 5
+
+    _CACHE[previous_key] = [str(item.get("code", "")) for item in adjusted[: max(1, top_n)]]
+    return adjusted
 
 
 @app.get("/api/v1/watchlist")
@@ -359,23 +693,27 @@ def get_watchlist(user_key: str = Query(default="default")) -> dict[str, Any]:
 
 
 @app.post("/api/v1/watchlist")
-def upsert_watchlist(payload: WatchlistRequest) -> dict[str, Any]:
+def upsert_watchlist(payload: WatchlistRequest, request: Request) -> dict[str, Any]:
+    _require_trusted_origin(request)
     tickers = _add_watchlist_tickers(payload.user_key, payload.tickers)
     return {"userKey": payload.user_key, "tickers": tickers}
 
 
 @app.post("/api/v1/watchlist/upload")
-def upload_watchlist(payload: WatchlistRequest) -> dict[str, Any]:
+def upload_watchlist(payload: WatchlistRequest, request: Request) -> dict[str, Any]:
+    _require_trusted_origin(request)
     tickers = _add_watchlist_tickers(payload.user_key, payload.tickers)
     return {"userKey": payload.user_key, "tickers": tickers}
 
 
 @app.post("/api/v1/watchlist/upload-csv")
 async def upload_watchlist_csv(
+    request: Request,
     file: UploadFile = File(...),
     user_key: str = Form(default="default"),
     replace: bool = Form(default=False),
 ) -> dict[str, Any]:
+    _require_trusted_origin(request)
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="CSV 파일이 비어 있습니다.")
@@ -400,8 +738,10 @@ async def upload_watchlist_csv(
 @app.delete("/api/v1/watchlist/{ticker}")
 def delete_watchlist_ticker(
     ticker: str,
+    request: Request,
     user_key: str = Query(default="default"),
 ) -> dict[str, Any]:
+    _require_trusted_origin(request)
     tickers = _remove_watchlist_ticker(user_key=user_key, ticker=ticker)
     return {"userKey": user_key, "tickers": tickers}
 
@@ -413,6 +753,10 @@ def strategy_status(
     status = get_strategy_status(requested_date_str=date)
     if status.get("errorCode") == "INVALID_DATE":
         raise _strategy_error(str(status["errorCode"]), str(status.get("detail") or "유효하지 않은 날짜 형식입니다."))
+    strategy_advisories = _build_strategy_advisories(
+        requested_date=str(status.get("requestedDate") or ""),
+        available_strategies=list(status.get("availableStrategies") or []),
+    )
     return {
         "timezone": status["timezone"],
         "nowKst": status["nowKst"],
@@ -420,10 +764,96 @@ def strategy_status(
         "availableStrategies": status["availableStrategies"],
         "defaultStrategy": status["defaultStrategy"],
         "messages": status["messages"],
+        "strategyAdvisories": strategy_advisories,
         "errorCode": status.get("errorCode"),
         "detail": status.get("detail"),
         "nonTradingDay": status.get("nonTradingDay"),
     }
+
+
+@app.post("/api/v1/telemetry/web-vitals")
+def telemetry_web_vitals(payload: WebVitalRequest) -> dict[str, Any]:
+    allowed_names = {"FCP", "LCP", "CLS", "INP", "TTFB"}
+    if payload.name.upper() not in allowed_names:
+        raise HTTPException(status_code=400, detail="지원하지 않는 web-vitals 지표입니다.")
+    if payload.value < 0:
+        raise HTTPException(status_code=400, detail="value는 0 이상이어야 합니다.")
+
+    row = {
+        "id": payload.id,
+        "name": payload.name.upper(),
+        "value": payload.value,
+        "rating": payload.rating,
+        "path": payload.path,
+        "ts": payload.ts,
+        "recordedAt": datetime.utcnow().isoformat() + "Z",
+    }
+    try:
+        _WEB_VITALS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _WEB_VITALS_LOG_PATH.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"telemetry write failed: {type(exc).__name__}") from exc
+    return {"ok": True}
+
+
+@app.get("/api/v1/strategy-validation")
+def strategy_validation(
+    strategy: str = Query(default="intraday"),
+    date: Optional[str] = None,
+    user_key: str = Query(default="default"),
+    custom_tickers: Optional[str] = Query(default=None),
+    w_return: float = Query(default=0.4),
+    w_stability: float = Query(default=0.3),
+    w_market: float = Query(default=0.3),
+    intraday_signal_branch: Optional[str] = Query(default=None),
+    compare_branches: bool = Query(default=False),
+    compute_if_missing: bool = Query(default=True),
+) -> dict[str, Any]:
+    resolved_strategy = (strategy or "").strip().lower()
+    if resolved_strategy not in {"premarket", "intraday", "close"}:
+        raise _strategy_error("INVALID_STRATEGY", "strategy 값은 premarket, intraday 또는 close 여야 합니다.")
+    try:
+        weights = normalize_weights(w_return, w_stability, w_market)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    resolved_custom = _resolve_custom_tickers(user_key=user_key, custom_tickers_csv=custom_tickers)
+    as_of_date = get_latest_trading_date(date)
+    effective_intraday_branch = _resolve_effective_intraday_signal_branch(
+        strategy=resolved_strategy,
+        requested_branch=intraday_signal_branch,
+        as_of_date=as_of_date,
+        custom_tickers=resolved_custom,
+        weights=weights,
+    )
+    summary = _resolve_strategy_validation(
+        strategy=resolved_strategy,
+        as_of_date=as_of_date,
+        custom_tickers=resolved_custom,
+        weights=weights,
+        intraday_signal_branch=effective_intraday_branch,
+        compare_branches=compare_branches,
+        compute_if_missing=compute_if_missing,
+    )
+    payload = {
+        "strategy": resolved_strategy,
+        "requestedDate": date,
+        "asOfDate": summary.get("asOfDate", as_of_date),
+        "mode": summary.get("mode"),
+        "gateStatus": summary.get("gateStatus"),
+        "gatePassed": summary.get("gatePassed"),
+        "insufficientData": summary.get("insufficientData"),
+        "validationPenalty": summary.get("validationPenalty", 0.0),
+        "thresholds": summary.get("thresholds", {}),
+        "protocol": summary.get("protocol", {}),
+        "metrics": summary.get("metrics", {}),
+        "monitoring": summary.get("monitoring", {"logged": False, "alerts": []}),
+        "weights": weights,
+        "customTickers": resolved_custom,
+    }
+    if "branchComparison" in summary:
+        payload["branchComparison"] = summary.get("branchComparison")
+    return payload
 
 
 @app.get("/api/v1/weights/recommendation")
@@ -452,6 +882,8 @@ def market_overview(
     user_key: str = Query(default="default"),
     custom_tickers: Optional[str] = Query(default=None),
     strategy: Optional[str] = Query(default=None),
+    intraday_signal_branch: Optional[str] = Query(default=None),
+    force_refresh: bool = Query(default=False),
 ) -> dict[str, Any]:
     strategy_ctx = _ensure_strategy_allowed(date=date, strategy=strategy)
     effective_date = str(strategy_ctx["signalDate"])
@@ -459,20 +891,29 @@ def market_overview(
     resolved_strategy = str(strategy_ctx["strategy"])
     strategy_reason = str(strategy_ctx.get("strategyReason") or "")
     resolved_custom = _resolve_custom_tickers(user_key=user_key, custom_tickers_csv=custom_tickers)
+    effective_intraday_branch = _resolve_effective_intraday_signal_branch(
+        strategy=resolved_strategy,
+        requested_branch=intraday_signal_branch,
+        as_of_date=session_date,
+        custom_tickers=resolved_custom,
+        weights=DEFAULT_WEIGHTS,
+    )
     cache_key = _build_cache_key(
         "overview",
         date=effective_date,
         session_date=session_date,
         strategy=resolved_strategy,
+        intraday_signal_branch=(effective_intraday_branch or ""),
         intraday_bucket=_intraday_cache_bucket(resolved_strategy, session_date),
         user_key=user_key,
         custom=",".join(sorted(resolved_custom)),
     )
-    cached_overview = _CACHE.get(cache_key)
-    if isinstance(cached_overview, dict):
-        total = int(cached_overview.get("up", 0)) + int(cached_overview.get("down", 0)) + int(cached_overview.get("steady", 0))
-        if total >= _MIN_CANDIDATE_CACHE_COUNT:
-            return cached_overview
+    if not force_refresh:
+        cached_overview = _CACHE.get(cache_key)
+        if isinstance(cached_overview, dict):
+            total = int(cached_overview.get("up", 0)) + int(cached_overview.get("down", 0)) + int(cached_overview.get("steady", 0))
+            if total >= _MIN_CANDIDATE_CACHE_COUNT:
+                return cached_overview
 
     data = _fetch_candidates_best_effort(
         date=effective_date,
@@ -484,6 +925,7 @@ def market_overview(
         enforce_exposure_cap=False,
         max_per_sector=2,
         cap_top_n=5,
+        intraday_signal_branch=effective_intraday_branch,
     )
     indices = get_market_indices(data["date"])
     overview = get_market_overview(data["candidates"], indices=indices)
@@ -510,26 +952,50 @@ def stock_candidates(
     enforce_exposure_cap: bool = Query(default=False),
     max_per_sector: int = Query(default=2, ge=1, le=5),
     cap_top_n: int = Query(default=5, ge=1, le=20),
+    include_validation: bool = Query(default=True),
+    intraday_signal_branch: Optional[str] = Query(default=None),
+    force_refresh: bool = False,
+    refresh_token: Optional[str] = None,
 ) -> list[dict[str, Any]]:
+    force_refresh_flag = bool(force_refresh)
+    refresh_token_value = refresh_token if isinstance(refresh_token, str) else None
     strategy_ctx = _ensure_strategy_allowed(date=date, strategy=strategy)
     effective_date = str(strategy_ctx["signalDate"])
     session_date = str(strategy_ctx["sessionDate"])
     resolved_strategy = str(strategy_ctx["strategy"])
     strategy_reason = str(strategy_ctx.get("strategyReason") or "")
     resolved_custom = _resolve_custom_tickers(user_key=user_key, custom_tickers_csv=custom_tickers)
+    effective_auto_regime_weights = auto_regime_weights and resolved_strategy != "intraday"
     weights, regime = _resolve_weights(
         date=effective_date,
         custom_tickers=resolved_custom,
         w_return=w_return,
         w_stability=w_stability,
         w_market=w_market,
-        auto_regime_weights=auto_regime_weights,
+        auto_regime_weights=effective_auto_regime_weights,
+    )
+    effective_intraday_branch = _resolve_effective_intraday_signal_branch(
+        strategy=resolved_strategy,
+        requested_branch=intraday_signal_branch,
+        as_of_date=session_date,
+        custom_tickers=resolved_custom,
+        weights=weights,
+    )
+    validation_summary = _resolve_strategy_validation(
+        strategy=resolved_strategy,
+        as_of_date=session_date,
+        custom_tickers=resolved_custom,
+        weights=weights,
+        intraday_signal_branch=effective_intraday_branch,
+        compare_branches=False,
+        compute_if_missing=include_validation and (not force_refresh_flag) and _VALIDATION_COMPUTE_ON_REQUEST,
     )
     cache_key = _build_cache_key(
         "candidates",
         date=effective_date,
         session_date=session_date,
         strategy=resolved_strategy,
+        intraday_signal_branch=(effective_intraday_branch or ""),
         intraday_bucket=_intraday_cache_bucket(resolved_strategy, session_date),
         user_key=user_key,
         custom=",".join(sorted(resolved_custom)),
@@ -540,11 +1006,27 @@ def stock_candidates(
         cap=enforce_exposure_cap,
         max_per_sector=max_per_sector,
         cap_top_n=cap_top_n,
-        auto=auto_regime_weights,
+        auto=effective_auto_regime_weights,
     )
     cached_candidates = _CACHE.get(cache_key)
-    if _is_candidate_cache_valid(cached_candidates):
-        return _decorate_candidates_for_response(
+    restrict_symbols: list[str] | None = None
+    fetch_attempts = 2
+    if force_refresh_flag and resolved_strategy == "intraday":
+        fetch_attempts = 1
+        if isinstance(cached_candidates, list) and cached_candidates:
+            resolved_symbols: list[str] = []
+            for item in cached_candidates:
+                symbol = _symbol_from_code(str(item.get("code", "")))
+                if symbol and symbol not in resolved_symbols:
+                    resolved_symbols.append(symbol)
+                if len(resolved_symbols) >= _INTRADAY_FORCE_REFRESH_SYMBOL_LIMIT:
+                    break
+            if resolved_symbols:
+                restrict_symbols = resolved_symbols
+        if not restrict_symbols:
+            restrict_symbols = list(TICKERS.keys())[:_INTRADAY_FORCE_REFRESH_SYMBOL_LIMIT]
+    if not force_refresh_flag and _is_candidate_cache_valid(cached_candidates):
+        decorated = _decorate_candidates_for_response(
             candidates=cached_candidates,
             session_date=session_date,
             effective_date=effective_date,
@@ -553,6 +1035,7 @@ def stock_candidates(
             weights=weights,
             regime_name=regime["regime"] if regime else None,
         )
+        return _attach_validation_to_candidates(decorated, validation_summary=validation_summary)
 
     payload = _fetch_candidates_best_effort(
         date=effective_date,
@@ -564,6 +1047,9 @@ def stock_candidates(
         enforce_exposure_cap=enforce_exposure_cap,
         max_per_sector=max_per_sector,
         cap_top_n=cap_top_n,
+        intraday_signal_branch=effective_intraday_branch,
+        restrict_symbols=restrict_symbols,
+        attempts=fetch_attempts,
     )
     fresh = _decorate_candidates_for_response(
         candidates=payload["candidates"],
@@ -574,12 +1060,22 @@ def stock_candidates(
         weights=weights,
         regime_name=regime["regime"] if regime else None,
     )
+    if force_refresh_flag and resolved_strategy == "intraday":
+        fresh = _apply_intraday_force_refresh_rotation(
+            candidates=fresh,
+            user_key=user_key,
+            session_date=session_date,
+            top_n=cap_top_n,
+            refresh_token=refresh_token_value,
+        )
+    fresh_for_response = _attach_validation_to_candidates(fresh, validation_summary=validation_summary)
+    fresh_for_cache = _strip_validation_annotations(fresh)
     if _is_candidate_cache_valid(fresh):
-        _CACHE[cache_key] = fresh
-        return fresh
+        _CACHE[cache_key] = fresh_for_cache
+        return fresh_for_response
 
-    if isinstance(cached_candidates, list) and len(cached_candidates) > len(fresh):
-        return _decorate_candidates_for_response(
+    if (not force_refresh_flag) and isinstance(cached_candidates, list) and len(cached_candidates) > len(fresh):
+        fallback = _decorate_candidates_for_response(
             candidates=cached_candidates,
             session_date=session_date,
             effective_date=effective_date,
@@ -588,8 +1084,9 @@ def stock_candidates(
             weights=weights,
             regime_name=regime["regime"] if regime else None,
         )
-    _CACHE[cache_key] = fresh
-    return fresh
+        return _attach_validation_to_candidates(fallback, validation_summary=validation_summary)
+    _CACHE[cache_key] = fresh_for_cache
+    return fresh_for_response
 
 
 @app.get("/api/v1/stocks/{ticker}/detail")
@@ -607,6 +1104,7 @@ def stock_detail(
     auto_regime_weights: bool = Query(default=False),
     account_size: float = Query(default=10_000_000.0, gt=0),
     risk_per_trade_pct: float = Query(default=1.0, gt=0, le=10),
+    intraday_signal_branch: Optional[str] = Query(default=None),
 ) -> dict[str, Any]:
     strategy_ctx = _ensure_strategy_allowed(date=date, strategy=strategy)
     effective_date = str(strategy_ctx["signalDate"])
@@ -622,6 +1120,13 @@ def stock_detail(
         w_market=w_market,
         auto_regime_weights=auto_regime_weights,
     )
+    effective_intraday_branch = _resolve_effective_intraday_signal_branch(
+        strategy=resolved_strategy,
+        requested_branch=intraday_signal_branch,
+        as_of_date=session_date,
+        custom_tickers=resolved_custom,
+        weights=weights,
+    )
     candidate, trade_date = _find_candidate(
         ticker=ticker,
         date=effective_date,
@@ -629,6 +1134,7 @@ def stock_detail(
         strategy=resolved_strategy,
         session_date=session_date,
         custom_tickers=resolved_custom,
+        intraday_signal_branch=effective_intraday_branch,
     )
     content_trade_date = session_date if resolved_strategy == "premarket" else trade_date
 
@@ -751,6 +1257,7 @@ def market_insight(
     enforce_exposure_cap: bool = Query(default=False),
     max_per_sector: int = Query(default=2, ge=1, le=5),
     cap_top_n: int = Query(default=5, ge=1, le=20),
+    intraday_signal_branch: Optional[str] = Query(default=None),
 ) -> dict[str, Any]:
     strategy_ctx = _ensure_strategy_allowed(date=date, strategy=strategy)
     effective_date = str(strategy_ctx["signalDate"])
@@ -766,12 +1273,19 @@ def market_insight(
         w_market=w_market,
         auto_regime_weights=auto_regime_weights,
     )
+    effective_intraday_branch = _resolve_effective_intraday_signal_branch(
+        strategy=resolved_strategy,
+        requested_branch=intraday_signal_branch,
+        as_of_date=session_date,
+        custom_tickers=resolved_custom,
+        weights=weights,
+    )
     candidates = stock_candidates(
         date=session_date,
         w_return=weights["return"],
         w_stability=weights["stability"],
         w_market=weights["market"],
-        include_sparkline=False,
+        include_sparkline=True,
         user_key=user_key,
         custom_tickers=",".join(resolved_custom) if resolved_custom else None,
         strategy=resolved_strategy,
@@ -779,6 +1293,9 @@ def market_insight(
         enforce_exposure_cap=enforce_exposure_cap,
         max_per_sector=max_per_sector,
         cap_top_n=cap_top_n,
+        intraday_signal_branch=effective_intraday_branch,
+        force_refresh=False,
+        refresh_token=None,
     )
     overview = get_market_overview(candidates)
     up = overview.get("up", 0)

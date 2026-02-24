@@ -2,13 +2,18 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from sqlalchemy import Date, DateTime, Float, Integer, String, UniqueConstraint, func
+from sqlalchemy import JSON, Date, DateTime, Float, Integer, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
     pass
+
+
+def _json_type():
+    # Keep JSONB on PostgreSQL while allowing SQLite/local development with generic JSON.
+    return JSON().with_variant(JSONB, "postgresql")
 
 
 class RecommendationSnapshot(Base):
@@ -26,8 +31,8 @@ class RecommendationSnapshot(Base):
     total_score: Mapped[float] = mapped_column(Float, nullable=False)
     target_price: Mapped[float] = mapped_column(Float, nullable=False)
     stop_loss: Mapped[float] = mapped_column(Float, nullable=False)
-    tags: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
-    sparkline60: Mapped[list[float]] = mapped_column(JSONB, nullable=False, default=list)
+    tags: Mapped[list[str]] = mapped_column(_json_type(), nullable=False, default=list)
+    sparkline60: Mapped[list[float]] = mapped_column(_json_type(), nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 
 
@@ -52,9 +57,9 @@ class StockNewsCache(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     ticker: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     trade_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
-    news_items: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, default=list)
-    summary3: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
-    themes: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    news_items: Mapped[list[dict]] = mapped_column(_json_type(), nullable=False, default=list)
+    summary3: Mapped[list[str]] = mapped_column(_json_type(), nullable=False, default=list)
+    themes: Mapped[list[str]] = mapped_column(_json_type(), nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 
 
@@ -70,7 +75,7 @@ class AIReport(Base):
     provider: Mapped[str] = mapped_column(String(64), nullable=False)
     model: Mapped[str] = mapped_column(String(128), nullable=False)
     prompt_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    report: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    report: Mapped[dict] = mapped_column(_json_type(), nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 
 

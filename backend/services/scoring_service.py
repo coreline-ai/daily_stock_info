@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 from services.news_service import fetch_stock_news_items
 from services.sparkline_service import build_sparkline60
+from services.intraday_store_service import fetch_intraday_with_store
 
 StrategyKind = Literal["premarket", "close", "intraday"]
 
@@ -191,8 +192,10 @@ KST = ZoneInfo("Asia/Seoul")
 MARKET_PREMARKET_START_TIME = time(hour=8, minute=0)
 MARKET_INTRADAY_START_TIME = time(hour=9, minute=5)
 MARKET_INTRADAY_END_TIME = time(hour=15, minute=20)
+MARKET_CLOSE_STRATEGY_START_TIME = time(hour=15, minute=0)
 MARKET_CLOSE_TIME = time(hour=15, minute=30)
 INTRADAY_MODE = (os.getenv("INTRADAY_MODE", "proxy").strip().lower() or "proxy")
+INTRADAY_SIGNAL_BRANCH = (os.getenv("INTRADAY_SIGNAL_BRANCH", "phase2").strip().lower() or "phase2")
 
 _TRADING_DAY_CACHE: dict[str, bool] = {}
 _KRX_CALENDAR: Any | None = None
@@ -300,6 +303,51 @@ def _download_frame(ticker_symbol: str, start_date: datetime, end_date: datetime
     if isinstance(frame.columns, pd.MultiIndex):
         frame.columns = frame.columns.droplevel(1)
     return frame
+
+
+def _download_intraday_frame(
+    ticker_symbol: str,
+    start_date: datetime,
+    end_date: datetime,
+    interval: str = "5m",
+) -> pd.DataFrame:
+    def _fetch_from_yf(symbol: str, start_dt: datetime, end_dt: datetime, tf: str) -> pd.DataFrame:
+        frame = yf.download(
+            symbol,
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=end_dt.strftime("%Y-%m-%d"),
+            interval=tf,
+            progress=False,
+            auto_adjust=False,
+            prepost=False,
+        )
+        if isinstance(frame.columns, pd.MultiIndex):
+            frame.columns = frame.columns.droplevel(1)
+        return frame
+
+    return fetch_intraday_with_store(
+        symbol=ticker_symbol,
+        start_date=start_date,
+        end_date=end_date,
+        interval=interval,
+        fetcher=_fetch_from_yf,
+    )
+
+
+def _to_kst_datetime_index(index: Any) -> pd.DatetimeIndex:
+    parsed = pd.to_datetime(index, errors="coerce")
+    if not isinstance(parsed, pd.DatetimeIndex):
+        parsed = pd.DatetimeIndex([])
+    if parsed.tz is None:
+        return parsed.tz_localize(KST, nonexistent="shift_forward", ambiguous="NaT")
+    return parsed.tz_convert(KST)
+
+
+def _between_time_inclusive(frame: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    try:
+        return frame.between_time(start, end, inclusive="both")
+    except TypeError:
+        return frame.between_time(start, end, include_start=True, include_end=True)
 
 
 def _load_krx_exchange_calendar() -> Any | None:
@@ -522,7 +570,7 @@ def get_strategy_status(requested_date_str: str | None, now_kst_value: datetime 
     now_time = now_kst_value.time()
     if now_time < MARKET_PREMARKET_START_TIME:
         status["messages"]["premarket"] = "장전 전략은 08:00(KST)부터 조회할 수 있습니다."
-        status["messages"]["close"] = "종가 전략은 15:30(KST) 이후 조회할 수 있습니다."
+        status["messages"]["close"] = "종가 전략은 15:00(KST) 이후 조회할 수 있습니다."
         status["messages"]["intraday"] = "장중 단타 전략은 09:05(KST)부터 15:20(KST)까지 조회할 수 있습니다."
         return status
 
@@ -530,23 +578,31 @@ def get_strategy_status(requested_date_str: str | None, now_kst_value: datetime 
         status["availableStrategies"] = ["premarket"]
         status["defaultStrategy"] = "premarket"
         status["messages"]["premarket"] = "현재 장전 전략 조회 가능 시간입니다."
-        status["messages"]["close"] = "종가 전략은 15:30(KST) 이후 조회할 수 있습니다."
+        status["messages"]["close"] = "종가 전략은 15:00(KST) 이후 조회할 수 있습니다."
         status["messages"]["intraday"] = "장중 단타 전략은 09:05(KST)부터 조회할 수 있습니다."
         return status
 
-    if now_time <= MARKET_INTRADAY_END_TIME:
+    if now_time < MARKET_CLOSE_STRATEGY_START_TIME:
         status["availableStrategies"] = ["premarket", "intraday"]
         status["defaultStrategy"] = "intraday"
         status["messages"]["premarket"] = "당일 장전 전략 결과는 리플레이 조회가 가능합니다."
-        status["messages"]["close"] = "종가 전략은 15:30(KST) 이후 조회할 수 있습니다."
+        status["messages"]["close"] = "종가 전략은 15:00(KST) 이후 조회할 수 있습니다."
+        status["messages"]["intraday"] = "현재 장중 단타 전략 조회 가능 시간입니다."
+        return status
+
+    if now_time <= MARKET_INTRADAY_END_TIME:
+        status["availableStrategies"] = ["premarket", "intraday", "close"]
+        status["defaultStrategy"] = "intraday"
+        status["messages"]["premarket"] = "당일 장전 전략 결과는 리플레이 조회가 가능합니다."
+        status["messages"]["close"] = "현재 종가 전략 조회 가능 시간입니다."
         status["messages"]["intraday"] = "현재 장중 단타 전략 조회 가능 시간입니다."
         return status
 
     if now_time < MARKET_CLOSE_TIME:
-        status["availableStrategies"] = ["premarket"]
-        status["defaultStrategy"] = "premarket"
+        status["availableStrategies"] = ["premarket", "close"]
+        status["defaultStrategy"] = "close"
         status["messages"]["premarket"] = "당일 장전 전략 결과는 리플레이 조회가 가능합니다."
-        status["messages"]["close"] = "종가 전략은 15:30(KST) 이후 조회할 수 있습니다."
+        status["messages"]["close"] = "현재 종가 전략 조회 가능 시간입니다."
         status["messages"]["intraday"] = "장중 단타 전략은 15:20(KST)에 마감되었습니다."
         return status
 
@@ -624,8 +680,17 @@ def _normalize_ticker(raw: str) -> list[str]:
     return [ticker]
 
 
-def _build_universe(custom_tickers: list[str] | None = None) -> dict[str, str]:
-    universe = dict(TICKERS)
+def _build_universe(
+    custom_tickers: list[str] | None = None,
+    restrict_symbols: list[str] | None = None,
+) -> dict[str, str]:
+    if restrict_symbols:
+        restricted = [symbol for symbol in restrict_symbols if symbol in TICKERS]
+        universe = {symbol: TICKERS[symbol] for symbol in restricted}
+        if not universe:
+            universe = dict(TICKERS)
+    else:
+        universe = dict(TICKERS)
     existing_codes = {_code_from_symbol(symbol) for symbol in universe.keys()}
     if not custom_tickers:
         return universe
@@ -857,8 +922,133 @@ def _compute_intraday_bars_signals(
     code: str,
     session_date: str,
 ) -> dict[str, float] | None:
-    # Phase 2 placeholder: replace with 5m ORB/VWAP/RVOL computation.
-    _ = (code, session_date)
+    try:
+        session_day = datetime.strptime(session_date, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+    symbols = _normalize_ticker(code)
+    if not symbols:
+        return None
+
+    for symbol in symbols:
+        try:
+            intraday_end = datetime.combine(session_day + timedelta(days=1), time.min)
+            intraday_start = intraday_end - timedelta(days=14)
+            bars = _download_intraday_frame(
+                symbol,
+                start_date=intraday_start,
+                end_date=intraday_end,
+                interval="5m",
+            )
+            if bars.empty:
+                continue
+            required_cols = {"Open", "High", "Low", "Close", "Volume"}
+            if not required_cols.issubset(set(str(col) for col in bars.columns)):
+                continue
+
+            bars = bars.copy()
+            bars.index = _to_kst_datetime_index(bars.index)
+            bars = bars[~bars.index.isna()]
+            if bars.empty:
+                continue
+
+            bars = _between_time_inclusive(bars, "09:00", "15:20")
+            if bars.empty:
+                continue
+
+            session_bars = bars[[idx.date() == session_day for idx in bars.index]]
+            if session_bars.empty or len(session_bars) < 3:
+                continue
+
+            first_range = session_bars.iloc[:3]
+            orb_high = float(first_range["High"].max())
+            orb_low = float(first_range["Low"].min())
+            session_open = float(session_bars["Open"].iloc[0])
+            last_close = float(session_bars["Close"].iloc[-1])
+            session_high = float(session_bars["High"].max())
+            session_low = float(session_bars["Low"].min())
+
+            volume = pd.to_numeric(session_bars["Volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            cum_volume = volume.cumsum()
+            if cum_volume.empty or float(cum_volume.iloc[-1]) <= 0:
+                continue
+            typical_price = (session_bars["High"] + session_bars["Low"] + session_bars["Close"]) / 3.0
+            vwap_series = ((typical_price * volume).cumsum() / cum_volume.replace(0, np.nan)).ffill()
+            vwap_val = float(vwap_series.iloc[-1]) if not vwap_series.empty and pd.notna(vwap_series.iloc[-1]) else last_close
+
+            orb_mid = (orb_high + orb_low) / 2.0
+            orb_span = max(orb_high - orb_low, max(session_open * 0.002, 0.01))
+            orb_breakout = (last_close - orb_mid) / orb_span
+            orb_score = _clamp_score(5.0 + (orb_breakout * 2.4))
+
+            vwap_dev_pct = ((last_close - vwap_val) / vwap_val) * 100 if vwap_val else 0.0
+            vwap_score = _clamp_score(5.0 + (vwap_dev_pct * 2.0))
+
+            current_ts = session_bars.index[-1]
+            current_tod = current_ts.time()
+            current_cum_volume = float(cum_volume.iloc[-1])
+
+            history = bars[[idx.date() < session_day for idx in bars.index]]
+            rvol_profile_ratio = 1.0
+            if not history.empty:
+                hist_vol = pd.to_numeric(history["Volume"], errors="coerce").fillna(0.0).clip(lower=0.0)
+                history = history.copy()
+                history["_volume"] = hist_vol
+                historical_cums: list[float] = []
+                for _, day_frame in history.groupby(history.index.date):
+                    sliced = day_frame[[ts.time() <= current_tod for ts in day_frame.index]]
+                    if sliced.empty:
+                        continue
+                    historical_cums.append(float(sliced["_volume"].sum()))
+                baseline = float(np.mean(historical_cums)) if historical_cums else 0.0
+                if baseline > 0:
+                    rvol_profile_ratio = current_cum_volume / baseline
+
+            rvol_score = _clamp_score(5.0 + ((rvol_profile_ratio - 1.0) * 3.2))
+
+            daily_end = datetime.combine(session_day + timedelta(days=1), time.min)
+            daily_start = daily_end - timedelta(days=60)
+            daily_frame = _download_frame(symbol, daily_start, daily_end)
+            prev_close = 0.0
+            if not daily_frame.empty and "Close" in daily_frame:
+                daily_frame = daily_frame.copy()
+                daily_frame.index = pd.to_datetime(daily_frame.index, errors="coerce")
+                daily_frame = daily_frame[~daily_frame.index.isna()]
+                prev_close_series = daily_frame[[idx.date() < session_day for idx in daily_frame.index]]["Close"]
+                if not prev_close_series.empty and pd.notna(prev_close_series.iloc[-1]):
+                    prev_close = float(prev_close_series.iloc[-1])
+
+            overnight_return_pct = ((session_open - prev_close) / prev_close) * 100 if prev_close else 0.0
+            intraday_return_pct = ((last_close - session_open) / session_open) * 100 if session_open else 0.0
+            intraday_momentum_score = _clamp_score(5.0 + (intraday_return_pct * 2.4))
+
+            is_reversal = overnight_return_pct * intraday_return_pct < 0
+            reversal_mag = min(abs(overnight_return_pct), abs(intraday_return_pct))
+            overnight_reversal_score = _clamp_score(
+                5.0 + (2.0 if is_reversal else -1.0) + (reversal_mag * 1.1)
+            )
+
+            session_range_pct = ((session_high - session_low) / max(session_open, 1e-9)) * 100
+            in_play_score = _clamp_score(4.5 + (session_range_pct * 1.1) + ((rvol_profile_ratio - 1.0) * 2.0))
+
+            return {
+                "orbScore": round(orb_score, 3),
+                "vwapScore": round(vwap_score, 3),
+                "rvolScore": round(rvol_score, 3),
+                "orbHigh": round(orb_high, 3),
+                "orbLow": round(orb_low, 3),
+                "vwap": round(vwap_val, 3),
+                "lastPrice": round(last_close, 3),
+                "rvolProfileRatio": round(rvol_profile_ratio, 3),
+                "inPlayScore": round(in_play_score, 3),
+                "intradayMomentumScore": round(intraday_momentum_score, 3),
+                "overnightReversalScore": round(overnight_reversal_score, 3),
+                "overnightReturnPct": round(overnight_return_pct, 3),
+                "intradayReturnPct": round(intraday_return_pct, 3),
+            }
+        except Exception:
+            continue
     return None
 
 
@@ -876,9 +1066,15 @@ def _apply_intraday_proxy_adjustments(
     avg_vol_20: float,
     session_date: str,
     mode: str,
+    signal_branch: str,
 ) -> tuple[dict[str, float], dict[str, float], float, dict[str, Any], list[str]]:
     resolved_mode = mode if mode in {"proxy", "bars"} else "proxy"
-    bar_signals = _compute_intraday_bars_signals(code=code, session_date=session_date) if resolved_mode == "bars" else None
+    resolved_branch = signal_branch if signal_branch in {"baseline", "phase2"} else "phase2"
+    bar_signals = (
+        _compute_intraday_bars_signals(code=code, session_date=session_date)
+        if resolved_mode == "bars" and resolved_branch == "phase2"
+        else None
+    )
 
     # Proxy fallback blends opening-range drift, proxy-VWAP deviation and relative volume.
     range_span = max(day_high - day_low, max(current_price * 0.005, 1.0))
@@ -893,19 +1089,58 @@ def _apply_intraday_proxy_adjustments(
     rvol_ratio = today_volume / max(avg_vol_20, 1.0)
     rvol_score = _clamp_score(5.0 + ((rvol_ratio - 1.0) * 3.0))
 
+    in_play_score = None
+    intraday_momentum_score = None
+    overnight_reversal_score = None
+    rvol_profile_ratio = None
+    overnight_return_pct = None
+    intraday_return_pct = None
     if bar_signals:
         orb_proxy_score = _clamp_score(float(bar_signals.get("orbScore", orb_proxy_score)))
         vwap_proxy_score = _clamp_score(float(bar_signals.get("vwapScore", vwap_proxy_score)))
         rvol_score = _clamp_score(float(bar_signals.get("rvolScore", rvol_score)))
-        signal_mode = "bars"
+        in_play_score = _clamp_score(float(bar_signals.get("inPlayScore", 5.0)))
+        intraday_momentum_score = _clamp_score(float(bar_signals.get("intradayMomentumScore", orb_proxy_score)))
+        overnight_reversal_score = _clamp_score(float(bar_signals.get("overnightReversalScore", 5.0)))
+        rvol_profile_ratio = float(bar_signals.get("rvolProfileRatio", rvol_ratio))
+        overnight_return_pct = float(bar_signals.get("overnightReturnPct", 0.0))
+        intraday_return_pct = float(bar_signals.get("intradayReturnPct", open_drift_pct))
+        signal_mode = "bars-phase2"
     else:
-        signal_mode = "proxy" if resolved_mode == "proxy" else "proxy-fallback"
+        if resolved_mode == "proxy":
+            signal_mode = "proxy"
+        elif resolved_branch == "phase2":
+            signal_mode = "proxy-fallback"
+        else:
+            signal_mode = "proxy-baseline"
 
-    adjusted_raw = {
-        "return": _clamp_score((raw_scores["return"] * 0.45) + (orb_proxy_score * 0.35) + (vwap_proxy_score * 0.20)),
-        "stability": _clamp_score((raw_scores["stability"] * 0.70) + ((10.0 - abs(vwap_proxy_score - 5.0)) * 0.30)),
-        "market": _clamp_score((raw_scores["market"] * 0.55) + (rvol_score * 0.45)),
-    }
+    if bar_signals and resolved_branch == "phase2":
+        adjusted_raw = {
+            "return": _clamp_score(
+                (raw_scores["return"] * 0.35)
+                + (orb_proxy_score * 0.25)
+                + (vwap_proxy_score * 0.15)
+                + (float(intraday_momentum_score or 5.0) * 0.15)
+                + (float(in_play_score or 5.0) * 0.10)
+            ),
+            "stability": _clamp_score(
+                (raw_scores["stability"] * 0.55)
+                + ((10.0 - abs(vwap_proxy_score - 5.0)) * 0.15)
+                + (float(overnight_reversal_score or 5.0) * 0.15)
+                + ((10.0 - abs(float(intraday_momentum_score or 5.0) - 5.0)) * 0.15)
+            ),
+            "market": _clamp_score(
+                (raw_scores["market"] * 0.40)
+                + (rvol_score * 0.35)
+                + (float(in_play_score or 5.0) * 0.25)
+            ),
+        }
+    else:
+        adjusted_raw = {
+            "return": _clamp_score((raw_scores["return"] * 0.45) + (orb_proxy_score * 0.35) + (vwap_proxy_score * 0.20)),
+            "stability": _clamp_score((raw_scores["stability"] * 0.70) + ((10.0 - abs(vwap_proxy_score - 5.0)) * 0.30)),
+            "market": _clamp_score((raw_scores["market"] * 0.55) + (rvol_score * 0.45)),
+        }
     adjusted_weighted = {
         "return": round(adjusted_raw["return"] * score_weights["return"], 3),
         "stability": round(adjusted_raw["stability"] * score_weights["stability"], 3),
@@ -915,6 +1150,7 @@ def _apply_intraday_proxy_adjustments(
 
     intraday_signals = {
         "mode": signal_mode,
+        "signalBranch": resolved_branch,
         "orbProxyScore": round(orb_proxy_score, 3),
         "vwapProxyScore": round(vwap_proxy_score, 3),
         "rvolScore": round(rvol_score, 3),
@@ -924,6 +1160,22 @@ def _apply_intraday_proxy_adjustments(
         "vwapProxyPrice": round(vwap_proxy_price, 3),
         "rvolRatio": round(rvol_ratio, 3),
     }
+    if bar_signals:
+        intraday_signals["orbHigh"] = round(float(bar_signals.get("orbHigh", day_high)), 3)
+        intraday_signals["orbLow"] = round(float(bar_signals.get("orbLow", day_low)), 3)
+        intraday_signals["vwapPrice"] = round(float(bar_signals.get("vwap", vwap_proxy_price)), 3)
+    if in_play_score is not None:
+        intraday_signals["inPlayScore"] = round(float(in_play_score), 3)
+    if intraday_momentum_score is not None:
+        intraday_signals["intradayMomentumScore"] = round(float(intraday_momentum_score), 3)
+    if overnight_reversal_score is not None:
+        intraday_signals["overnightReversalScore"] = round(float(overnight_reversal_score), 3)
+    if rvol_profile_ratio is not None:
+        intraday_signals["rvolProfileRatio"] = round(float(rvol_profile_ratio), 3)
+    if overnight_return_pct is not None:
+        intraday_signals["overnightReturnPct"] = round(float(overnight_return_pct), 3)
+    if intraday_return_pct is not None:
+        intraday_signals["intradayReturnPct"] = round(float(intraday_return_pct), 3)
     merged_tags = ["INTRADAY", *tags] if "INTRADAY" not in tags else tags[:]
     return adjusted_raw, adjusted_weighted, total_score, intraday_signals, merged_tags
 
@@ -1088,6 +1340,8 @@ def fetch_and_score_stocks(
     cap_top_n: int = 5,
     strategy: StrategyKind = "close",
     session_date_str: str | None = None,
+    intraday_signal_branch: str | None = None,
+    restrict_symbols: list[str] | None = None,
 ) -> dict[str, Any]:
     strategy_value = str(strategy).lower()
     if strategy_value == "premarket":
@@ -1116,9 +1370,19 @@ def fetch_and_score_stocks(
     start_date = end_date - timedelta(days=180)
     candidates: list[dict[str, Any]] = []
 
-    universe = _build_universe(custom_tickers=custom_tickers)
+    if restrict_symbols is None:
+        universe = _build_universe(custom_tickers=custom_tickers)
+    else:
+        universe = _build_universe(custom_tickers=custom_tickers, restrict_symbols=restrict_symbols)
     overnight_proxy_cache = _compute_overnight_proxy_score(session_date) if normalized_strategy == "premarket" else None
     intraday_mode = INTRADAY_MODE if INTRADAY_MODE in {"proxy", "bars"} else "proxy"
+    resolved_intraday_branch = (
+        str(intraday_signal_branch).strip().lower()
+        if intraday_signal_branch is not None
+        else INTRADAY_SIGNAL_BRANCH
+    )
+    if resolved_intraday_branch not in {"baseline", "phase2"}:
+        resolved_intraday_branch = "phase2"
 
     for ticker_symbol, name in universe.items():
         try:
@@ -1172,6 +1436,7 @@ def fetch_and_score_stocks(
                     avg_vol_20=float(signals.get("avgVol20", 0.0)),
                     session_date=session_date,
                     mode=intraday_mode,
+                    signal_branch=resolved_intraday_branch,
                 )
                 scoring_raw = adjusted_raw
                 weighted_scores = adjusted_weighted
@@ -1204,7 +1469,9 @@ def fetch_and_score_stocks(
                 summary = (
                     f"장중 단타 신호(ORB={intraday_signals['orbProxyScore']:.1f}, "
                     f"VWAP={intraday_signals['vwapProxyScore']:.1f}, "
-                    f"RVOL={intraday_signals['rvolScore']:.1f}, mode={intraday_signals['mode']}). "
+                    f"RVOL={intraday_signals['rvolScore']:.1f}, "
+                    f"branch={intraday_signals.get('signalBranch', 'phase2')}, "
+                    f"mode={intraday_signals['mode']}). "
                     f"{summary}"
                 )
 
@@ -1257,6 +1524,11 @@ def fetch_and_score_stocks(
 
     if enforce_exposure_cap:
         candidates = apply_sector_exposure_cap(candidates, top_n=cap_top_n, max_per_sector=max_per_sector)
+
+    for idx, item in enumerate(candidates):
+        rank = int(item.get("rank", idx + 1))
+        item["rank"] = rank
+        item["strongRecommendation"] = rank <= 5
 
     return {
         "date": signal_date,
@@ -1331,3 +1603,30 @@ def get_price_series_for_ticker(code: str, trade_date: str, future_days: int = 7
         if not frame.empty:
             return frame["Close"]
     return pd.Series(dtype=float)
+
+
+def get_trade_day_ohlc_for_ticker(code: str, trade_date: str) -> dict[str, float | None]:
+    start = datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=2)
+    end = datetime.strptime(trade_date, "%Y-%m-%d") + timedelta(days=2)
+    target_day = datetime.strptime(trade_date, "%Y-%m-%d").date()
+    symbols = [code] if "." in code else [f"{code}.KS", f"{code}.KQ"]
+
+    for symbol in symbols:
+        try:
+            frame = _download_frame(symbol, start, end)
+            if frame.empty:
+                continue
+            idx = pd.to_datetime(frame.index)
+            for pos, ts in enumerate(idx):
+                if pd.Timestamp(ts).date() != target_day:
+                    continue
+                row = frame.iloc[pos]
+                return {
+                    "open": float(row["Open"]) if pd.notna(row["Open"]) else None,
+                    "high": float(row["High"]) if pd.notna(row["High"]) else None,
+                    "low": float(row["Low"]) if pd.notna(row["Low"]) else None,
+                    "close": float(row["Close"]) if pd.notna(row["Close"]) else None,
+                }
+        except Exception:
+            continue
+    return {"open": None, "high": None, "low": None, "close": None}

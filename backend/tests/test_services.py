@@ -364,6 +364,7 @@ def test_intraday_scoring_contains_signal_block(monkeypatch) -> None:
     monkeypatch.setattr(scoring_service, "_download_frame", lambda ticker_symbol, start_date, end_date: base)
     monkeypatch.setattr(scoring_service, "_build_universe", lambda custom_tickers=None: {"005930.KS": "Samsung Electronics"})
     monkeypatch.setattr(scoring_service, "INTRADAY_MODE", "proxy")
+    monkeypatch.setattr(scoring_service, "INTRADAY_SIGNAL_BRANCH", "phase2")
     payload = fetch_and_score_stocks(
         date_str="2026-02-20",
         strategy="intraday",
@@ -375,9 +376,146 @@ def test_intraday_scoring_contains_signal_block(monkeypatch) -> None:
     cand = payload["candidates"][0]
     signals = cand["details"]["intradaySignals"]
     assert signals["mode"] == "proxy"
+    assert signals["signalBranch"] == "phase2"
     assert "orbProxyScore" in signals
     assert "vwapProxyScore" in signals
     assert "rvolScore" in signals
+
+
+def test_intraday_scoring_uses_phase2_bar_signals_when_available(monkeypatch) -> None:
+    idx = pd.date_range("2025-10-01", periods=120, freq="B")
+    daily = pd.DataFrame(
+        {
+            "Open": [100 + i * 0.1 for i in range(len(idx))],
+            "High": [101 + i * 0.1 for i in range(len(idx))],
+            "Low": [99 + i * 0.1 for i in range(len(idx))],
+            "Close": [100 + i * 0.1 for i in range(len(idx))],
+            "Volume": [2_000_000 for _ in range(len(idx))],
+        },
+        index=idx,
+    )
+
+    intraday_index = pd.DatetimeIndex(
+        list(pd.date_range("2026-02-18 09:00", periods=12, freq="5min"))
+        + list(pd.date_range("2026-02-19 09:00", periods=12, freq="5min"))
+        + list(pd.date_range("2026-02-20 09:00", periods=12, freq="5min"))
+    )
+    intraday = pd.DataFrame(
+        {
+            "Open": [120.0 + (i * 0.05) for i in range(len(intraday_index))],
+            "High": [120.5 + (i * 0.05) for i in range(len(intraday_index))],
+            "Low": [119.5 + (i * 0.05) for i in range(len(intraday_index))],
+            "Close": [120.1 + (i * 0.07) for i in range(len(intraday_index))],
+            "Volume": ([9_000] * 24) + ([25_000] * 12),
+        },
+        index=intraday_index,
+    )
+
+    monkeypatch.setattr(scoring_service, "_download_frame", lambda ticker_symbol, start_date, end_date: daily)
+    monkeypatch.setattr(
+        scoring_service,
+        "_download_intraday_frame",
+        lambda ticker_symbol, start_date, end_date, interval="5m": intraday,
+    )
+    monkeypatch.setattr(scoring_service, "_build_universe", lambda custom_tickers=None: {"005930.KS": "Samsung Electronics"})
+    monkeypatch.setattr(scoring_service, "INTRADAY_MODE", "bars")
+    monkeypatch.setattr(scoring_service, "INTRADAY_SIGNAL_BRANCH", "phase2")
+
+    payload = fetch_and_score_stocks(
+        date_str="2026-02-20",
+        strategy="intraday",
+        session_date_str="2026-02-20",
+        include_sparkline=False,
+    )
+    cand = payload["candidates"][0]
+    signals = cand["details"]["intradaySignals"]
+    assert signals["signalBranch"] == "phase2"
+    assert signals["mode"] == "bars-phase2"
+    assert "inPlayScore" in signals
+    assert "intradayMomentumScore" in signals
+    assert "overnightReversalScore" in signals
+    assert "overnightReturnPct" in signals
+    assert "intradayReturnPct" in signals
+
+
+def test_intraday_baseline_branch_uses_proxy_when_bars_enabled(monkeypatch) -> None:
+    idx = pd.date_range("2025-10-01", periods=120, freq="B")
+    daily = pd.DataFrame(
+        {
+            "Open": [100 + i * 0.1 for i in range(len(idx))],
+            "High": [101 + i * 0.1 for i in range(len(idx))],
+            "Low": [99 + i * 0.1 for i in range(len(idx))],
+            "Close": [100 + i * 0.1 for i in range(len(idx))],
+            "Volume": [2_000_000 for _ in range(len(idx))],
+        },
+        index=idx,
+    )
+
+    monkeypatch.setattr(scoring_service, "_download_frame", lambda ticker_symbol, start_date, end_date: daily)
+    monkeypatch.setattr(scoring_service, "_build_universe", lambda custom_tickers=None: {"005930.KS": "Samsung Electronics"})
+    monkeypatch.setattr(scoring_service, "INTRADAY_MODE", "bars")
+    monkeypatch.setattr(scoring_service, "INTRADAY_SIGNAL_BRANCH", "phase2")
+    monkeypatch.setattr(
+        scoring_service,
+        "_compute_intraday_bars_signals",
+        lambda code, session_date: (_ for _ in ()).throw(AssertionError("baseline branch should not call bars")),
+    )
+
+    payload = fetch_and_score_stocks(
+        date_str="2026-02-20",
+        strategy="intraday",
+        session_date_str="2026-02-20",
+        include_sparkline=False,
+        intraday_signal_branch="baseline",
+    )
+    signals = payload["candidates"][0]["details"]["intradaySignals"]
+    assert signals["signalBranch"] == "baseline"
+    assert signals["mode"] == "proxy-baseline"
+    assert "inPlayScore" not in signals
+
+
+def test_strong_recommendation_marks_only_top5(monkeypatch) -> None:
+    idx = pd.date_range("2025-10-01", periods=120, freq="B")
+    base = pd.DataFrame(
+        {
+            "Open": [100 + i * 0.1 for i in range(len(idx))],
+            "High": [101 + i * 0.1 for i in range(len(idx))],
+            "Low": [99 + i * 0.1 for i in range(len(idx))],
+            "Close": [100 + i * 0.1 for i in range(len(idx))],
+            "Volume": [1_700_000 for _ in range(len(idx))],
+        },
+        index=idx,
+    )
+
+    monkeypatch.setattr(scoring_service, "_download_frame", lambda ticker_symbol, start_date, end_date: base)
+    monkeypatch.setattr(
+        scoring_service,
+        "_build_universe",
+        lambda custom_tickers=None: {
+            "000001.KS": "Mock 1",
+            "000002.KS": "Mock 2",
+            "000003.KS": "Mock 3",
+            "000004.KS": "Mock 4",
+            "000005.KS": "Mock 5",
+            "000006.KS": "Mock 6",
+        },
+    )
+
+    payload = fetch_and_score_stocks(
+        date_str="2026-02-20",
+        strategy="close",
+        session_date_str="2026-02-20",
+        include_sparkline=False,
+        enforce_exposure_cap=False,
+    )
+
+    assert len(payload["candidates"]) == 6
+    assert all("strongRecommendation" in candidate for candidate in payload["candidates"])
+    assert sum(1 for candidate in payload["candidates"] if candidate["strongRecommendation"]) == 5
+    assert payload["candidates"][4]["rank"] == 5
+    assert payload["candidates"][4]["strongRecommendation"] is True
+    assert payload["candidates"][5]["rank"] == 6
+    assert payload["candidates"][5]["strongRecommendation"] is False
 
 
 def test_is_krx_trading_day_respects_external_calendar_holiday(monkeypatch) -> None:

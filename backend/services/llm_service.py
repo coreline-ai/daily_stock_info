@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from datetime import datetime, timezone
 from typing import Any
+from pydantic import BaseModel, ValidationError
 
 try:
     from openai import OpenAI
@@ -17,6 +19,14 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 DEFAULT_OPENAI_BASE_URL = "https://api.z.ai/api/coding/paas/v4"
+PROMPT_VERSION = "v2-guardrail"
+FORBIDDEN_CLAIMS = (
+    "원금 보장",
+    "확정 수익",
+    "무조건 수익",
+    "반드시 오릅니다",
+    "투자 자문",
+)
 MODEL_ALIAS_MAP = {
     "GLM4.7": "GLM-4.7",
     "glm4.7": "glm-4.7",
@@ -33,6 +43,17 @@ def _normalize_model_id(model: str) -> str:
 DEFAULT_MODEL = _normalize_model_id(os.getenv("ZHIPU_MODEL", "GLM4.7"))
 DEFAULT_PROBE_TIMEOUT_SEC = 12.0
 DEFAULT_CANDIDATE_MODELS = ["GLM-4.7", "glm-4.7", "GLM4.7", "glm4.7"]
+
+
+class RiskFactorSchema(BaseModel):
+    id: str
+    description: str
+
+
+class AiReportSchema(BaseModel):
+    summary: str
+    conclusion: str
+    riskFactors: list[RiskFactorSchema]
 
 _LLM_RUNTIME: dict[str, Any] = {
     "initialized": False,
@@ -357,6 +378,24 @@ def _extract_json(content: str) -> dict[str, Any]:
     return json.loads(content)
 
 
+def _contains_forbidden_claims(text: str) -> str | None:
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return None
+    for claim in FORBIDDEN_CLAIMS:
+        if claim.lower() in lowered:
+            return claim
+    return None
+
+
+def _validate_ai_report_schema(parsed: dict[str, Any]) -> tuple[bool, str | None]:
+    try:
+        AiReportSchema.model_validate(parsed)
+        return True, None
+    except ValidationError as exc:
+        return False, f"schema-validation-failed:{exc.errors()[0].get('type', 'unknown')}"
+
+
 def ensure_ai_report_shape(
     report: dict[str, Any] | None,
     *,
@@ -371,6 +410,8 @@ def ensure_ai_report_shape(
     normalized.setdefault("provider", "deterministic-fallback")
     normalized.setdefault("model", DEFAULT_MODEL)
     normalized.setdefault("generatedAt", _utc_iso_now())
+    normalized.setdefault("promptVersion", PROMPT_VERSION)
+    normalized.setdefault("promptHash", "")
     normalized.setdefault("summary", "")
     normalized.setdefault("conclusion", "")
     if "fallbackReason" in normalized and not isinstance(normalized.get("fallbackReason"), str):
@@ -399,6 +440,14 @@ def ensure_ai_report_shape(
             "warnings": warnings if isinstance(warnings, list) else [],
         }
 
+    claim = _contains_forbidden_claims(str(normalized.get("summary", "")))
+    claim = claim or _contains_forbidden_claims(str(normalized.get("conclusion", "")))
+    if claim:
+        fallback = _fallback_with_reason(stock, news_summary, themes, reason=f"guardrail-blocked-claim:{claim}")
+        fallback["promptVersion"] = normalized.get("promptVersion", PROMPT_VERSION)
+        fallback["promptHash"] = normalized.get("promptHash", "")
+        return fallback
+
     return normalized
 
 
@@ -409,14 +458,18 @@ def generate_ai_report(
     trade_date: str,
 ) -> dict[str, Any]:
     api_key = os.getenv("ZHIPU_API_KEY", "").strip() or os.getenv("OPENAI_API_KEY", "").strip()
+    prompt = _build_prompt(stock, news_summary, themes, trade_date)
+    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     if not api_key:
         reason = "ZHIPU_API_KEY/OPENAI_API_KEY is missing."
-        return _fallback_with_reason(stock, news_summary, themes, reason=reason)
+        fallback = _fallback_with_reason(stock, news_summary, themes, reason=reason)
+        fallback["promptVersion"] = PROMPT_VERSION
+        fallback["promptHash"] = prompt_hash
+        return fallback
 
     status = get_llm_runtime_status()
     model = get_effective_model()
     base_url = str(status.get("baseUrl") or DEFAULT_OPENAI_BASE_URL)
-    prompt = _build_prompt(stock, news_summary, themes, trade_date)
 
     try:
         provider = "deterministic-fallback"
@@ -445,10 +498,27 @@ def generate_ai_report(
             provider = "zhipu"
             content = response.choices[0].message.content if response and response.choices else ""
         else:
-            return _fallback_with_reason(stock, news_summary, themes, reason="No LLM SDK available.")
+            fallback = _fallback_with_reason(stock, news_summary, themes, reason="No LLM SDK available.")
+            fallback["promptVersion"] = PROMPT_VERSION
+            fallback["promptHash"] = prompt_hash
+            return fallback
 
         parsed = _extract_json(content)
+        is_valid, validation_error = _validate_ai_report_schema(parsed)
+        if not is_valid:
+            fallback = _fallback_with_reason(stock, news_summary, themes, reason=str(validation_error or "schema-validation-failed"))
+            fallback["promptVersion"] = PROMPT_VERSION
+            fallback["promptHash"] = prompt_hash
+            return fallback
+
         risk_factors = parsed.get("riskFactors", [])
+        guardrail_claim = _contains_forbidden_claims(str(parsed.get("summary", "")))
+        guardrail_claim = guardrail_claim or _contains_forbidden_claims(str(parsed.get("conclusion", "")))
+        if guardrail_claim:
+            fallback = _fallback_with_reason(stock, news_summary, themes, reason=f"guardrail-blocked-claim:{guardrail_claim}")
+            fallback["promptVersion"] = PROMPT_VERSION
+            fallback["promptHash"] = prompt_hash
+            return fallback
         confidence = _confidence_payload(
             provider=provider,
             news_summary=news_summary,
@@ -463,6 +533,11 @@ def generate_ai_report(
             "conclusion": str(parsed.get("conclusion", "")).strip(),
             "riskFactors": risk_factors if isinstance(risk_factors, list) else [],
             "confidence": confidence,
+            "promptVersion": PROMPT_VERSION,
+            "promptHash": prompt_hash,
         }
     except Exception as exc:
-        return _fallback_with_reason(stock, news_summary, themes, reason=f"LLM request failed: {exc.__class__.__name__}")
+        fallback = _fallback_with_reason(stock, news_summary, themes, reason=f"LLM request failed: {exc.__class__.__name__}")
+        fallback["promptVersion"] = PROMPT_VERSION
+        fallback["promptHash"] = prompt_hash
+        return fallback
