@@ -17,11 +17,11 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000"),
   title: {
-    default: "DailyStock AI",
-    template: "%s | DailyStock AI",
+    default: "Coreline Stock AI",
+    template: "%s | Coreline Stock AI",
   },
   description: "KRX 중심 단기 전략 추천, 장중 단타 신호, 검증 게이트(PBO/DSR)와 리스크 요약 대시보드",
-  keywords: ["KRX", "장중 단타", "주식 전략", "전략 검증", "DailyStock"],
+  keywords: ["KRX", "장중 단타", "주식 전략", "전략 검증", "Coreline Stock"],
   alternates: {
     canonical: "/",
   },
@@ -29,13 +29,13 @@ export const metadata: Metadata = {
     type: "website",
     locale: "ko_KR",
     url: "/",
-    siteName: "DailyStock AI",
-    title: "DailyStock AI",
+    siteName: "Coreline Stock AI",
+    title: "Coreline Stock AI",
     description: "장중 단타·종가 전략 추천 및 검증 대시보드",
   },
   twitter: {
     card: "summary_large_image",
-    title: "DailyStock AI",
+    title: "Coreline Stock AI",
     description: "장중 단타·종가 전략 추천 및 검증 대시보드",
   },
 };

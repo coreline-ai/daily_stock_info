@@ -914,7 +914,7 @@ export default function Home() {
           <div>
             <h1 className="text-2xl font-bold flex items-center gap-2">
               <span className="text-blue-400">📈</span>
-              DailyStock AI
+              Coreline Stock AI
             </h1>
             <p className="text-color-muted text-sm mt-1">국면 감지, 섹터 캡, 신뢰도, 워치리스트</p>
           </div>

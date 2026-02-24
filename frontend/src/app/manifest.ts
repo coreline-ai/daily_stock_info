@@ -2,8 +2,8 @@ import type { MetadataRoute } from "next";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "DailyStock AI",
-    short_name: "DailyStock",
+    name: "Coreline Stock AI",
+    short_name: "Coreline",
     description: "KRX 중심 단기 전략 추천 및 검증 대시보드",
     start_url: "/",
     display: "standalone",

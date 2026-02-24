@@ -1,4 +1,4 @@
-# DailyStock AI
+# Coreline Stock AI
 
 <p align="left">
   <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white"></a>
@@ -49,9 +49,6 @@ KRX 중심의 단기 전략 추천 서비스입니다.
 
 ### 3) 백테스트 히스토리 (시가/종가/현재가 포함)
 ![History Desktop](docs/screenshots/history-desktop.png)
-
-### 4) 모바일 화면
-![Dashboard Mobile](docs/screenshots/dashboard-mobile.png)
 
 > 캡처 파일은 `docs/screenshots`에 저장되어 있으며, README와 함께 버전 관리됩니다.
 

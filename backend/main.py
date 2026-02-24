@@ -57,7 +57,7 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="DailyStock AI API", version="2.1.0", lifespan=lifespan)
+app = FastAPI(title="Coreline Stock AI API", version="2.1.0", lifespan=lifespan)
 
 _CACHE: Dict[str, Any] = {}
 _WATCHLIST: Dict[str, set[str]] = {}

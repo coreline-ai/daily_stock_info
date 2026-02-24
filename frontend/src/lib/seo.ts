@@ -21,7 +21,7 @@ export function buildWebsiteJsonLd(siteUrl: string): Record<string, unknown> {
   return {
     "@context": "https://schema.org",
     "@type": "WebSite",
-    name: "DailyStock AI",
+    name: "Coreline Stock AI",
     url: siteUrl,
     inLanguage: "ko-KR",
   };
@@ -31,7 +31,7 @@ export function buildOrganizationJsonLd(siteUrl: string): Record<string, unknown
   return {
     "@context": "https://schema.org",
     "@type": "Organization",
-    name: "DailyStock AI",
+    name: "Coreline Stock AI",
     url: siteUrl,
     logo: `${siteUrl}/favicon.ico`,
   };
