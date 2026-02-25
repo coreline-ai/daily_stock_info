@@ -544,12 +544,15 @@ export default function Home() {
         return;
       }
       if (strategyStatus?.requestedDate && strategyStatus.requestedDate !== selectedDate) {
+        setLoading(false);
         return;
       }
       if (lastUserTriggerDate && lastUserTriggerDate !== selectedDate) {
+        setLoading(false);
         return;
       }
       if (lastProcessedReloadTriggerRef.current === reloadTriggerId) {
+        setLoading(false);
         return;
       }
       if (!selectedStrategy) {

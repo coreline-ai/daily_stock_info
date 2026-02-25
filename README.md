@@ -5,6 +5,7 @@
   <a href="https://fastapi.tiangolo.com/"><img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-API-009688?logo=fastapi&logoColor=white"></a>
   <a href="https://nextjs.org/"><img alt="Next.js" src="https://img.shields.io/badge/Next.js-16.1.6-000000?logo=nextdotjs&logoColor=white"></a>
   <a href="https://react.dev/"><img alt="React" src="https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black"></a>
+  <a href="https://flutter.dev/"><img alt="Flutter" src="https://img.shields.io/badge/Flutter-Mobile-02569B?logo=flutter&logoColor=white"></a>
   <a href="./.github/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/badge/CI-GitHub_Actions-2088FF?logo=githubactions&logoColor=white"></a>
 </p>
 
@@ -32,6 +33,7 @@ KRX 중심의 단기 전략 추천 서비스입니다.
 - [환경 변수](#환경-변수)
 - [로컬 실행](#로컬-실행)
 - [테스트와 품질 게이트](#테스트와-품질-게이트)
+- [모바일 앱 (Flutter)](#모바일-앱-flutter)
 - [운영/모니터링](#운영모니터링)
 - [보안/SEO/PWA 적용 상태](#보안seopwa-적용-상태)
 - [트러블슈팅](#트러블슈팅)
@@ -392,6 +394,32 @@ npm ci
 NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000 npm run dev -- --hostname 127.0.0.1 --port 3000
 ```
 
+### 2-1) 동일 네트워크(LAN) 테스트
+
+같은 와이파이의 다른 기기(모바일/태블릿)에서 접속하려면 아래 스크립트를 사용하세요.
+
+```bash
+./scripts/run-lan-dev.sh
+```
+
+실행 시 자동으로:
+1. LAN IP 감지
+2. Backend `0.0.0.0:8000` 바인딩
+3. Frontend `0.0.0.0:3000` 바인딩
+4. Backend CORS(`FRONTEND_ALLOWED_ORIGINS`)에 `http://<LAN_IP>:3000` 반영
+5. 모바일 실행용 `flutter run --dart-define=API_BASE_URL=http://<LAN_IP>:8000` 명령 출력
+
+수동 지정이 필요하면:
+
+```bash
+LAN_IP=192.168.0.24 ./scripts/run-lan-dev.sh
+```
+
+접속이 안 되면 확인:
+1. 개발 PC와 모바일 기기가 같은 Wi-Fi인지
+2. macOS/Windows 방화벽에서 3000, 8000 포트 허용 여부
+3. 모바일 실행 시 API base URL이 `http://<LAN_IP>:8000`로 설정되었는지
+
 ### 3) Docker로 PostgreSQL만 실행(선택)
 
 ```bash
@@ -439,6 +467,133 @@ npm run build
   - lighthouse: LCP/CLS/INP assertion
 
 Lighthouse 임계값은 `.lighthouserc.json`에서 관리합니다.
+
+---
+
+## 모바일 앱 (Flutter)
+
+루트의 `mobile_flutter/`는 웹/백엔드와 기능 동등 수준으로 동작하는 Android/iOS 앱입니다.
+
+- 아키텍처: `Riverpod + Clean Architecture`
+- 네트워크: `Dio`
+- 라우팅: `go_router`
+- 로컬 캐시: `Hive` (대시보드 fallback + 마지막 트리거 시각)
+- 기본 정책: 자동 폴링 OFF, 사용자 입력 트리거 기반 로딩
+
+### 1) 지원 플랫폼/요구사항
+
+- Flutter stable (Dart 3.x)
+- Android: `minSdk 24+`
+- iOS: `13+`
+
+### 2) 주요 화면과 기능
+
+- Home
+  - 전략 선택(`premarket`/`intraday`/`close`)
+  - 추천 리스트 + 강력추천 TOP5 표시
+  - 장중 단타 추가 추천 섹션(토글)
+  - 종목 확장 상세(검증 상태, intraday signals, AI 요약)
+- Analysis
+  - `/api/v1/strategy-validation` 기반 검증 패널
+  - Net Sharpe / PBO / DSR / Sample Size
+- Watchlist
+  - 조회/추가/삭제
+  - CSV 업로드(append/replace)
+- History
+  - `/api/v1/backtest/summary`, `/api/v1/backtest/history`
+  - 시가/종가/현재가(기준일 포함) 표시
+- Settings
+  - API Base URL, 타임아웃, 테마, 캐시 초기화, 헬스체크
+
+### 3) 갱신/로딩 정책
+
+- 자동 주기 업데이트 없음
+- 아래 이벤트에서만 재조회
+  - 날짜 변경
+  - 전략 변경
+  - 프리셋/가중치 변경
+  - 수동 새로고침
+  - 워치리스트/커스텀 티커 변경
+- 마지막 사용자 트리거 시각을 로컬 저장
+- 네트워크 실패 시 캐시 데이터 fallback
+
+### 4) 모바일 로컬 실행
+
+```bash
+cd mobile_flutter
+flutter pub get
+flutter run
+```
+
+API URL 지정:
+
+```bash
+flutter run --dart-define=API_BASE_URL=http://127.0.0.1:8000
+```
+
+에뮬레이터 기준:
+- Android emulator: `http://10.0.2.2:8000`
+- iOS simulator: `http://127.0.0.1:8000`
+
+### 5) 동일 네트워크(LAN) 실기기 테스트
+
+루트에서 서버 동시 실행:
+
+```bash
+./scripts/run-lan-dev.sh
+```
+
+모바일 실행:
+
+```bash
+cd mobile_flutter
+flutter run --dart-define=API_BASE_URL=http://<LAN_IP>:8000
+```
+
+참고:
+- Backend CORS는 스크립트가 `http://<LAN_IP>:3000`를 자동 반영
+- 실기기 HTTP 테스트 허용 설정 적용
+  - Android: `usesCleartextTraffic=true`
+  - iOS: `NSAppTransportSecurity -> NSAllowsArbitraryLoads=true`
+
+### 6) 모바일 API 매핑
+
+| 기능 | API |
+|---|---|
+| 전략 상태 | `GET /api/v1/strategy-status` |
+| 시장 개요 | `GET /api/v1/market-overview` |
+| 후보 리스트 | `GET /api/v1/stock-candidates` |
+| 종목 상세 | `GET /api/v1/stocks/{ticker}/detail` |
+| 검증 요약 | `GET /api/v1/strategy-validation` |
+| 시장 인사이트 | `GET /api/v1/market-insight` |
+| 워치리스트 | `GET/POST/DELETE /api/v1/watchlist...` |
+| CSV 업로드 | `POST /api/v1/watchlist/upload-csv` |
+| 히스토리/요약 | `GET /api/v1/backtest/history`, `GET /api/v1/backtest/summary` |
+| 헬스체크 | `GET /api/v1/health` |
+
+### 7) 모바일 빌드/테스트
+
+```bash
+cd mobile_flutter
+flutter analyze
+flutter test
+flutter build apk --debug
+flutter build ios --no-codesign
+```
+
+CI 반영:
+- `.github/workflows/ci.yml`
+  - `mobile_android`: analyze/test/build apk
+  - `mobile_ios`: build ios --no-codesign
+
+### 8) 모바일 관련 주요 경로
+
+- 앱 엔트리: `mobile_flutter/lib/main.dart`
+- 라우터: `mobile_flutter/lib/app/router/app_router.dart`
+- Home 상태/로직: `mobile_flutter/lib/features/dashboard/presentation/providers/dashboard_providers.dart`
+- API 엔드포인트: `mobile_flutter/lib/core/network/api_endpoints.dart`
+- 로컬 캐시: `mobile_flutter/lib/core/storage/local_cache.dart`
+- 상세 모바일 가이드: `mobile_flutter/README.md`
 
 ---
 
