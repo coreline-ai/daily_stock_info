@@ -43,7 +43,9 @@ class _HomePageState extends ConsumerState<HomePage> {
     final state = ref.watch(dashboardControllerProvider);
     final controller = ref.read(dashboardControllerProvider.notifier);
     final candidates = state.filteredCandidates();
-    final visibleCandidates = _showAll ? candidates : candidates.take(5).toList(growable: false);
+    final visibleCandidates = _showAll
+        ? candidates
+        : candidates.take(5).toList(growable: false);
 
     return RefreshIndicator(
       onRefresh: controller.manualRefresh,
@@ -79,7 +81,9 @@ class _HomePageState extends ConsumerState<HomePage> {
               const SizedBox(height: 12),
               Text(
                 '마지막 입력 트리거: ${_formatTrigger(state.lastTriggerIso!)}',
-                style: Theme.of(context).textTheme.labelSmall?.copyWith(color: AppColors.textSecondary),
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: AppColors.textSecondary,
+                ),
               ),
             ],
             if (state.isFromCache) ...[
@@ -118,26 +122,35 @@ class _HomePageState extends ConsumerState<HomePage> {
                       candidate: candidate,
                       expanded: state.expandedTickers.contains(candidate.code),
                       detail: state.stockDetails[candidate.code],
-                      loadingDetail: state.detailLoadingTickers.contains(candidate.code),
+                      loadingDetail: state.detailLoadingTickers.contains(
+                        candidate.code,
+                      ),
                       onToggle: () => controller.toggleExpanded(candidate.code),
                     ),
                     const SizedBox(height: 12),
                   ],
                 ],
               ),
-            if (state.showIntradayExtra && state.intradayExtraCandidates.isNotEmpty) ...[
+            if (state.showIntradayExtra &&
+                state.intradayExtraCandidates.isNotEmpty) ...[
               const SizedBox(height: 18),
               Text(
                 '장중 단타 추가 추천',
-                style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+                style: Theme.of(
+                  context,
+                ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
               ),
               const SizedBox(height: 8),
-              for (final candidate in state.intradayExtraCandidates.take(5)) ...[
+              for (final candidate in state.intradayExtraCandidates.take(
+                5,
+              )) ...[
                 CandidateCard(
                   candidate: candidate,
                   expanded: state.expandedTickers.contains(candidate.code),
                   detail: state.stockDetails[candidate.code],
-                  loadingDetail: state.detailLoadingTickers.contains(candidate.code),
+                  loadingDetail: state.detailLoadingTickers.contains(
+                    candidate.code,
+                  ),
                   onToggle: () => controller.toggleExpanded(candidate.code),
                 ),
                 const SizedBox(height: 12),
@@ -209,9 +222,15 @@ class _Header extends StatelessWidget {
               height: 34,
               decoration: const BoxDecoration(
                 borderRadius: BorderRadius.all(Radius.circular(10)),
-                gradient: LinearGradient(colors: [Color(0xFF2563EB), Color(0xFF4F46E5)]),
+                gradient: LinearGradient(
+                  colors: [Color(0xFF2563EB), Color(0xFF4F46E5)],
+                ),
               ),
-              child: const Icon(Icons.ssid_chart_rounded, color: Colors.white, size: 20),
+              child: const Icon(
+                Icons.ssid_chart_rounded,
+                color: Colors.white,
+                size: 20,
+              ),
             ),
             const SizedBox(width: 8),
             Expanded(
@@ -228,11 +247,11 @@ class _Header extends StatelessWidget {
                     ),
                   ],
                 ),
-                style: theme.textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
+                style: theme.textTheme.titleLarge?.copyWith(
+                  fontWeight: FontWeight.w800,
+                ),
               ),
             ),
-            IconButton(onPressed: () {}, icon: const Icon(Icons.notifications_none_rounded)),
-            const CircleAvatar(radius: 15, child: Icon(Icons.person_outline_rounded, size: 16)),
           ],
         ),
         const SizedBox(height: 12),
@@ -288,30 +307,72 @@ class _StrategySection extends StatelessWidget {
       children: [
         Row(
           children: [
-            Text('Strategy Weighting', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800)),
+            Text(
+              'Strategy Weighting',
+              style: Theme.of(
+                context,
+              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+            ),
             const Spacer(),
-            Text('Auto-rebalance enabled', style: Theme.of(context).textTheme.labelSmall?.copyWith(color: AppColors.textSecondary)),
+            Text(
+              'Auto-rebalance enabled',
+              style: Theme.of(
+                context,
+              ).textTheme.labelSmall?.copyWith(color: AppColors.textSecondary),
+            ),
           ],
         ),
         const SizedBox(height: 8),
-        SegmentedButton<StrategyPreset>(
-          showSelectedIcon: false,
-          segments: presetLabels.entries
-              .map((entry) => ButtonSegment<StrategyPreset>(value: entry.key, label: Text(entry.value)))
-              .toList(growable: false),
-          selected: {state.preset},
-          onSelectionChanged: (selected) {
-            if (selected.isNotEmpty) {
-              onPresetChanged(selected.first);
-            }
-          },
+        Align(
+          alignment: Alignment.center,
+          child: SegmentedButton<StrategyPreset>(
+            showSelectedIcon: false,
+            segments: presetLabels.entries
+                .map(
+                  (entry) => ButtonSegment<StrategyPreset>(
+                    value: entry.key,
+                    label: SizedBox(
+                      width: 96,
+                      child: Text(
+                        entry.value,
+                        textAlign: TextAlign.center,
+                        maxLines: 1,
+                        softWrap: false,
+                        overflow: TextOverflow.fade,
+                      ),
+                    ),
+                  ),
+                )
+                .toList(growable: false),
+            selected: {state.preset},
+            onSelectionChanged: (selected) {
+              if (selected.isNotEmpty) {
+                onPresetChanged(selected.first);
+              }
+            },
+          ),
         ),
         const SizedBox(height: 10),
         Row(
           children: [
-            Expanded(child: Text('Profit ${state.weights.returnWeight.toStringAsFixed(2)}', style: Theme.of(context).textTheme.labelSmall)),
-            Expanded(child: Text('Stable ${state.weights.stabilityWeight.toStringAsFixed(2)}', style: Theme.of(context).textTheme.labelSmall)),
-            Expanded(child: Text('Growth ${state.weights.marketWeight.toStringAsFixed(2)}', style: Theme.of(context).textTheme.labelSmall)),
+            Expanded(
+              child: Text(
+                'Profit ${state.weights.returnWeight.toStringAsFixed(2)}',
+                style: Theme.of(context).textTheme.labelSmall,
+              ),
+            ),
+            Expanded(
+              child: Text(
+                'Stable ${state.weights.stabilityWeight.toStringAsFixed(2)}',
+                style: Theme.of(context).textTheme.labelSmall,
+              ),
+            ),
+            Expanded(
+              child: Text(
+                'Growth ${state.weights.marketWeight.toStringAsFixed(2)}',
+                style: Theme.of(context).textTheme.labelSmall,
+              ),
+            ),
           ],
         ),
         const SizedBox(height: 6),
@@ -319,26 +380,46 @@ class _StrategySection extends StatelessWidget {
           height: 8,
           child: Row(
             children: [
-              Expanded(flex: (state.weights.returnWeight * 100).round(), child: Container(color: Colors.blue)),
-              Expanded(flex: (state.weights.stabilityWeight * 100).round(), child: Container(color: Colors.indigo)),
-              Expanded(flex: (state.weights.marketWeight * 100).round(), child: Container(color: Colors.purple)),
+              Expanded(
+                flex: (state.weights.returnWeight * 100).round(),
+                child: Container(color: Colors.blue),
+              ),
+              Expanded(
+                flex: (state.weights.stabilityWeight * 100).round(),
+                child: Container(color: Colors.indigo),
+              ),
+              Expanded(
+                flex: (state.weights.marketWeight * 100).round(),
+                child: Container(color: Colors.purple),
+              ),
             ],
           ),
         ),
         const SizedBox(height: 12),
-        Wrap(
-          spacing: 8,
-          runSpacing: 8,
-          children: [
-            for (final item in StrategyKind.values)
-              FilledButton.tonal(
-                onPressed: () => onStrategyChanged(item),
-                style: FilledButton.styleFrom(
-                  backgroundColor: state.selectedStrategy == item ? AppColors.primary.withValues(alpha: 0.15) : null,
+        Align(
+          alignment: Alignment.center,
+          child: Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              for (final item in StrategyKind.values)
+                FilledButton.tonal(
+                  onPressed: () => onStrategyChanged(item),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: state.selectedStrategy == item
+                        ? AppColors.primary.withValues(alpha: 0.15)
+                        : null,
+                  ),
+                  child: Text(
+                    _strategyLabel(item),
+                    maxLines: 1,
+                    softWrap: false,
+                    overflow: TextOverflow.fade,
+                  ),
                 ),
-                child: Text(_strategyLabel(item)),
-              ),
-          ],
+            ],
+          ),
         ),
         const SizedBox(height: 8),
         SwitchListTile.adaptive(
@@ -408,21 +489,47 @@ class _OverviewSection extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     if (overview == null) {
-      return const SizedBox(height: 120, child: LoadingView(label: '시장 개요 로딩 중...'));
+      return const SizedBox(
+        height: 120,
+        child: LoadingView(label: '시장 개요 로딩 중...'),
+      );
     }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Market Overview', style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800)),
+        Text(
+          'Market Overview',
+          style: Theme.of(
+            context,
+          ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+        ),
         const SizedBox(height: 10),
         Row(
           children: [
-            Expanded(child: _OverviewCell(label: 'Decline', value: overview!.down, color: AppColors.accentRed)),
+            Expanded(
+              child: _OverviewCell(
+                label: 'Decline',
+                value: overview!.down,
+                color: AppColors.accentRed,
+              ),
+            ),
             const SizedBox(width: 8),
-            Expanded(child: _OverviewCell(label: 'Neutral', value: overview!.steady, color: Colors.grey)),
+            Expanded(
+              child: _OverviewCell(
+                label: 'Neutral',
+                value: overview!.steady,
+                color: Colors.grey,
+              ),
+            ),
             const SizedBox(width: 8),
-            Expanded(child: _OverviewCell(label: 'Growth', value: overview!.up, color: AppColors.accentGreen)),
+            Expanded(
+              child: _OverviewCell(
+                label: 'Growth',
+                value: overview!.up,
+                color: AppColors.accentGreen,
+              ),
+            ),
           ],
         ),
       ],
@@ -431,7 +538,11 @@ class _OverviewSection extends StatelessWidget {
 }
 
 class _OverviewCell extends StatelessWidget {
-  const _OverviewCell({required this.label, required this.value, required this.color});
+  const _OverviewCell({
+    required this.label,
+    required this.value,
+    required this.color,
+  });
 
   final String label;
   final int value;
@@ -445,9 +556,20 @@ class _OverviewCell extends StatelessWidget {
         padding: const EdgeInsets.symmetric(vertical: 16),
         child: Column(
           children: [
-            Text('$value', style: Theme.of(context).textTheme.headlineSmall?.copyWith(color: color, fontWeight: FontWeight.w800)),
+            Text(
+              '$value',
+              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                color: color,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
             const SizedBox(height: 4),
-            Text(label.toUpperCase(), style: Theme.of(context).textTheme.labelSmall?.copyWith(color: AppColors.textSecondary)),
+            Text(
+              label.toUpperCase(),
+              style: Theme.of(
+                context,
+              ).textTheme.labelSmall?.copyWith(color: AppColors.textSecondary),
+            ),
           ],
         ),
       ),
@@ -472,10 +594,17 @@ class _TopPicksHeader extends StatelessWidget {
       children: [
         Text(
           'Top Picks',
-          style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
+          style: Theme.of(
+            context,
+          ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),
         ),
         const SizedBox(width: 6),
-        Text('TOP5 Strategy', style: Theme.of(context).textTheme.labelMedium?.copyWith(color: AppColors.primary)),
+        Text(
+          'TOP5 Strategy',
+          style: Theme.of(
+            context,
+          ).textTheme.labelMedium?.copyWith(color: AppColors.primary),
+        ),
         const Spacer(),
         TextButton(
           onPressed: onToggle,
@@ -500,12 +629,24 @@ class _ValidationSection extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('전략 검증 요약', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+            Text(
+              '전략 검증 요약',
+              style: Theme.of(
+                context,
+              ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+            ),
             const SizedBox(height: 8),
-            Text('Gate ${validation.gateStatus.toUpperCase()} | Sharpe ${validation.netSharpe.toStringAsFixed(2)} | PBO ${validation.pbo.toStringAsFixed(2)} | DSR ${validation.dsr.toStringAsFixed(2)}'),
+            Text(
+              'Gate ${validation.gateStatus.toUpperCase()} | Sharpe ${validation.netSharpe.toStringAsFixed(2)} | PBO ${validation.pbo.toStringAsFixed(2)} | DSR ${validation.dsr.toStringAsFixed(2)}',
+            ),
             if (validation.alerts.isNotEmpty) ...[
               const SizedBox(height: 8),
-              Text(validation.alerts.join(' / '), style: Theme.of(context).textTheme.bodySmall?.copyWith(color: AppColors.textSecondary)),
+              Text(
+                validation.alerts.join(' / '),
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: AppColors.textSecondary),
+              ),
             ],
           ],
         ),
@@ -528,12 +669,25 @@ class _InsightSection extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Market Insight', style: Theme.of(context).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700)),
+            Text(
+              'Market Insight',
+              style: Theme.of(
+                context,
+              ).textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+            ),
             const SizedBox(height: 6),
-            Text(insight.conclusion, style: Theme.of(context).textTheme.bodyMedium),
+            Text(
+              insight.conclusion,
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
             if (insight.riskFactors.isNotEmpty) ...[
               const SizedBox(height: 8),
-              Text('리스크: ${insight.riskFactors.join(' / ')}', style: Theme.of(context).textTheme.bodySmall?.copyWith(color: AppColors.textSecondary)),
+              Text(
+                '리스크: ${insight.riskFactors.join(' / ')}',
+                style: Theme.of(
+                  context,
+                ).textTheme.bodySmall?.copyWith(color: AppColors.textSecondary),
+              ),
             ],
           ],
         ),
@@ -553,22 +707,35 @@ class _ProBanner extends StatelessWidget {
       width: double.infinity,
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(20),
-        gradient: const LinearGradient(colors: [Color(0xFF4F46E5), Color(0xFF2563EB)]),
+        gradient: const LinearGradient(
+          colors: [Color(0xFF4F46E5), Color(0xFF2563EB)],
+        ),
       ),
       padding: const EdgeInsets.all(16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Upgrade to Pro', style: Theme.of(context).textTheme.titleMedium?.copyWith(color: Colors.white, fontWeight: FontWeight.w700)),
+          Text(
+            'Upgrade to Pro',
+            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+              color: Colors.white,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
           const SizedBox(height: 4),
           Text(
             'Unlock advanced AI predictions and unlimited backtests.',
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.white.withValues(alpha: 0.9)),
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+              color: Colors.white.withValues(alpha: 0.9),
+            ),
           ),
           const SizedBox(height: 12),
           FilledButton(
             onPressed: onPressed,
-            style: FilledButton.styleFrom(backgroundColor: Colors.white, foregroundColor: AppColors.primary),
+            style: FilledButton.styleFrom(
+              backgroundColor: Colors.white,
+              foregroundColor: AppColors.primary,
+            ),
             child: const Text('View Plans'),
           ),
         ],

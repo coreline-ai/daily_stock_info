@@ -364,6 +364,17 @@ curl 'http://127.0.0.1:8000/api/v1/backtest/history?page=1&size=20'
 | `NEXT_PUBLIC_SITE_URL` | `http://localhost:3000` | canonical/sitemap/OG base |
 | `NEXT_PUBLIC_WEB_VITALS_SAMPLE_RATE` | `0.1` | vitals 샘플링 비율 |
 
+### 웹/API/앱 LAN 연동 권장 값
+
+같은 Wi-Fi에서 웹(브라우저) + API + 모바일 앱을 함께 테스트할 때는 아래처럼 맞추세요.
+
+| 위치 | 키 | 예시 값 (`LAN_IP=192.168.0.105`) |
+|---|---|---|
+| Backend (`backend/.env`) | `FRONTEND_ALLOWED_ORIGINS` | `http://192.168.0.105:3000` |
+| Frontend (`frontend/.env.local`) | `NEXT_PUBLIC_API_BASE_URL` | `http://192.168.0.105:8000` |
+| Frontend (`frontend/.env.local`) | `NEXT_PUBLIC_SITE_URL` | `http://192.168.0.105:3000` |
+| Mobile 실행 인자 | `API_BASE_URL` | `http://192.168.0.105:8000` |
+
 ---
 
 ## 로컬 실행
@@ -419,6 +430,38 @@ LAN_IP=192.168.0.24 ./scripts/run-lan-dev.sh
 1. 개발 PC와 모바일 기기가 같은 Wi-Fi인지
 2. macOS/Windows 방화벽에서 3000, 8000 포트 허용 여부
 3. 모바일 실행 시 API base URL이 `http://<LAN_IP>:8000`로 설정되었는지
+
+### 2-2) Windows에서 LAN 수동 실행(실기기 연결)
+
+`run-dev.ps1`은 기본적으로 `127.0.0.1`에 바인딩되므로, 실기기(LAN) 테스트는 아래처럼 별도 실행하세요.
+
+Backend:
+
+```powershell
+cd backend
+.\venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
+```
+
+Frontend:
+
+```powershell
+cd frontend
+$env:NEXT_PUBLIC_API_BASE_URL = "http://<LAN_IP>:8000"
+$env:NEXT_PUBLIC_SITE_URL = "http://<LAN_IP>:3000"
+npm run dev -- --hostname 0.0.0.0 --port 3000
+```
+
+모바일 앱:
+
+```powershell
+cd mobile_flutter
+flutter run --dart-define=API_BASE_URL=http://<LAN_IP>:8000
+```
+
+연결 확인:
+1. API 헬스체크: `http://<LAN_IP>:8000/api/v1/health`
+2. 웹 페이지: `http://<LAN_IP>:3000`
+3. 참고: `http://<LAN_IP>:8000/`에서 `{"detail":"Not Found"}`가 보이면 정상(루트 라우트 미구현)
 
 ### 3) Docker로 PostgreSQL만 실행(선택)
 
@@ -695,6 +738,40 @@ CI 반영:
 1. 재시도
 2. 요청 빈도 완화
 3. 분봉 Parquet store(`INTRADAY_STORE_MODE=parquet`) 활용
+
+### 6) `http://<LAN_IP>:8000/`이 `{"detail":"Not Found"}`로 표시됨
+
+원인:
+
+- 백엔드 루트(`/`)는 의도적으로 비워져 있음
+
+정상 확인 경로:
+
+1. `GET /api/v1/health`
+2. `GET /docs`
+
+### 7) 모바일/다른 PC에서 웹은 열리는데 API 호출이 실패
+
+점검:
+
+1. Frontend가 `NEXT_PUBLIC_API_BASE_URL=http://<LAN_IP>:8000`로 실행됐는지
+2. Backend의 `FRONTEND_ALLOWED_ORIGINS`에 `http://<LAN_IP>:3000`가 포함됐는지
+3. 서버 재시작 후 브라우저 캐시를 새로고침했는지
+
+### 8) Windows에서 같은 공유기인데 접속 불가
+
+점검:
+
+1. 네트워크 프로필이 `Private`인지 (`Public`이면 차단될 수 있음)
+2. Windows Defender Firewall 인바운드 규칙에 TCP `3000`, `8000` 허용이 있는지
+3. 관리자 권한 PowerShell에서 규칙을 추가했는지
+
+USB 디버깅 우회(같은 Wi-Fi가 어렵다면):
+
+```powershell
+adb reverse tcp:8000 tcp:8000
+adb reverse tcp:3000 tcp:3000
+```
 
 ---
 
