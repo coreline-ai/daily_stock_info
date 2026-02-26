@@ -76,6 +76,42 @@ jobs:
       - name: Build iOS (no codesign)
         run: flutter build ios --no-codesign
 
+  mobile_app_entire_android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mobile_app_entire
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Install mobile app deps
+        run: flutter pub get
+      - name: Architecture boundary check
+        run: ./tool/check_architecture_boundaries.sh
+      - name: Analyze
+        run: flutter analyze
+      - name: Unit and golden tests
+        run: flutter test
+      - name: Build Android debug APK
+        run: flutter build apk --debug
+
+  mobile_app_entire_ios:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: mobile_app_entire
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Install mobile app deps
+        run: flutter pub get
+      - name: Build iOS (no codesign)
+        run: flutter build ios --no-codesign
+
   lighthouse:
     runs-on: ubuntu-latest
     needs: [backend, frontend, mobile_android]
