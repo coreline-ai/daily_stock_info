@@ -1,4 +1,4 @@
-# Coreline Stock AI
+# Coreline Stock AI (+Flutter)
 
 <p align="left">
   <a href="https://www.python.org/"><img alt="Python" src="https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white"></a>
